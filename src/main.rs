@@ -10,7 +10,7 @@ use std::thread;
 use std::time::{Duration, SystemTime};
 use std::{fmt, usize};
 
-const SAFE_MODE: bool = true;
+const SAFE_MODE: bool = false;
 const BAN_LIMIT: Duration = Duration::from_secs(60 * 10);
 const MES_FREQ: Duration = Duration::from_secs(1);
 const BAN_FREQ: u32 = 10;
@@ -34,6 +34,7 @@ struct Client {
     conn: Arc<TcpStream>,
     last_message: SystemTime,
     strike_count: u32,
+    is_authorized: bool,
 }
 
 enum Messages {
@@ -49,7 +50,7 @@ enum Messages {
     },
 }
 
-fn server(messages_receiver: Receiver<Messages>) -> Result<()> {
+fn server(messages_receiver: Receiver<Messages>, token: String) -> Result<()> {
     let mut clients = HashMap::<SocketAddr, Client>::new();
     let mut banned_mfs = HashMap::<IpAddr, SystemTime>::new();
     loop {
@@ -91,6 +92,7 @@ fn server(messages_receiver: Receiver<Messages>) -> Result<()> {
                             conn: author.clone(),
                             last_message: now,
                             strike_count: 0,
+                            is_authorized: false,
                         },
                     );
                 }
@@ -104,14 +106,27 @@ fn server(messages_receiver: Receiver<Messages>) -> Result<()> {
                 if let Some(author) = clients.get_mut(&author_addr) {
                     let freq = now.duration_since(author.last_message).expect("TIME STUFF");
                     // Ban rules: utf8 String
-                    if let Ok(_text) = from_utf8(&bytes) {
-                        println!("author {} send {:?}", Sensitive(author_addr), bytes);
-                        // Banned Rules: freq
+                    if let Ok(text) = from_utf8(&bytes) {
+                        // Banned Rules: authed
                         if freq > MES_FREQ {
-                            author.last_message = now;
-                            for (addr, client) in clients.iter() {
-                                if *addr != author_addr {
-                                    let _ = client.conn.as_ref().write(&bytes);
+                            if author.is_authorized {
+                                // Banned Rules: freq
+                                author.last_message = now;
+                                println!("author {} send {:?}", Sensitive(author_addr), bytes);
+                                for (addr, client) in clients.iter() {
+                                    if *addr != author_addr && client.is_authorized {
+                                        let _ = client.conn.as_ref().write(&bytes);
+                                    }
+                                }
+                            } else {
+                                if token != text {
+                                    let _ = writeln!(&mut author.conn.as_ref(), "bro, not right token").map_err(|err| {
+                                        eprintln!("ERROR: Could not passing message to {author_addr}: {err}");
+                                    });
+                                    let _ = author.conn.as_ref().shutdown(std::net::Shutdown::Both).map_err(|err| {
+                                        eprintln!("ERROR: Failed to kill the tcp tunnel {author_addr}: {err}");
+                                 });
+                                    clients.remove(&author_addr);
                                 }
                             }
                         } else {
@@ -137,53 +152,25 @@ fn server(messages_receiver: Receiver<Messages>) -> Result<()> {
         }
     }
 }
-
-fn authorize(stream: &Arc<TcpStream>, author_address: &SocketAddr, token: &String) -> Result<()> {
-    let _ = write!(stream.as_ref(), "token: ").map_err(|err| {
-        eprintln!("ERROR: Could not passing message to {author_address}: {err}");
-    });
-    let mut buffer = [0u8; TOKEN_LEN * 2];
-    let n = stream.as_ref().read(&mut buffer).map_err(|err| {
-        eprintln!("ERROR: Could not read message from {author_address}: {err}");
-    })?;
-
-    if n < buffer.len() {
-        eprintln!("ERROR: Token Len is not legal : {n}");
-        return Err(());
-    }
-
-    let buffer = from_utf8(&buffer).map_err(|err| {
-        eprintln!("ERROR: illeagel utf8 token : {err}");
-    })?;
-
-    println!("get buffer {buffer}");
-
-    if token != buffer {
-        eprintln!("ERROR: Token not valid");
-        return Err(());
-    }
-
-    Ok(())
-}
-
-fn client(stream: Arc<TcpStream>, message_sender: Sender<Messages>, token: String) -> Result<()> {
+fn client(stream: Arc<TcpStream>, message_sender: Sender<Messages>) -> Result<()> {
     let author_address = stream
         .peer_addr()
         .map_err(|err| eprintln!("can not get the peer adderess: {err}"))?;
+    /*
+        authorize(&stream, &author_address, &token).map_err(|()| {
+            let _ = write!(stream.as_ref(), "Invalid Token ! ").map_err(|err| {
+                eprintln!("ERROR: Invalid Token : {err} ");
+            });
+            let _ = stream.shutdown(std::net::Shutdown::Both).map_err(|err| {
+                eprintln!("ERROR: Could not shutdown the connnection : {err} ");
+            });
+        })?;
 
-    authorize(&stream, &author_address, &token).map_err(|()| {
-        let _ = write!(stream.as_ref(), "Invalid Token ! ").map_err(|err| {
-            eprintln!("ERROR: Invalid Token : {err} ");
+        let _ = writeln!(stream.as_ref(), "Welcome to fight club buudy!!").map_err(|err| {
+            eprintln!("ERROR: failed to send message to {author_address}: {err} ");
         });
-        let _ = stream.shutdown(std::net::Shutdown::Both).map_err(|err| {
-            eprintln!("ERROR: Could not shutdown the connnection : {err} ");
-        });
-    })?;
 
-    let _ = writeln!(stream.as_ref(), "Welcome to fight club buudy!!").map_err(|err| {
-        eprintln!("ERROR: failed to send message to {author_address}: {err} ");
-    });
-
+    */
     message_sender
         .send(Messages::ClientConnected {
             author: stream.clone(),
@@ -251,15 +238,14 @@ fn main() -> Result<()> {
 
     let (message_sender, message_receiver) = channel();
 
-    thread::spawn(|| server(message_receiver));
+    thread::spawn(|| server(message_receiver, token));
 
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
                 let stream = Arc::new(stream);
                 let sender = message_sender.clone();
-                let token = token.clone();
-                thread::spawn(|| client(stream, sender, token));
+                thread::spawn(|| client(stream, sender));
             }
             Err(e) => {
                 eprintln!("disconnect with user : {}", Sensitive(e));
