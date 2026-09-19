@@ -21,22 +21,14 @@ fn chat_window(stdout: &mut impl Write, chat: &[String], boundary: Rect) -> io::
         let bytes = line.as_bytes();
         stdout
             .queue(MoveTo(boundary.x as u16, (boundary.y + dy) as u16))?
-            .write_all(bytes.get(0..boundary.w).unwrap_or(bytes))?;
+            .write(bytes.get(0..boundary.w).unwrap_or(bytes))?;
     }
     Ok(())
 }
 
 fn main() -> io::Result<()> {
-    // 在进入 raw mode 之前，从 stdin 读取服务器打印出来的 token。
-    let mut token = String::new();
-    io::stdin().read_line(&mut token)?;
-    let token = token.trim().to_string();
-
     let mut stream = TcpStream::connect("127.0.0.1:6969").expect("Can not connect to host");
     let _ = stream.set_nonblocking(true).expect("set block failed ");
-    // 服务器 authorize() 会先发 "token: "，然后阻塞等 32 字节 token，
-    // 所以这里连上后立刻把 token 发过去。
-    stream.write_all(token.as_bytes())?;
     let _ = terminal::enable_raw_mode()?;
     let mut stdout = stdout();
     let (mut w, mut h) = terminal::size()?;
@@ -113,9 +105,9 @@ fn main() -> io::Result<()> {
             },
         )?;
         stdout.queue(MoveTo(0, h - 2))?;
-        stdout.write_all(bar.as_bytes())?;
+        stdout.write(bar.as_bytes())?;
         stdout.queue(MoveTo(0, h - 1))?;
-        stdout.write_all(prompt.as_bytes())?;
+        stdout.write(prompt.as_bytes())?;
         stdout.flush()?;
         sleep(Duration::from_millis(33));
     }
