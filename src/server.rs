@@ -143,13 +143,16 @@ fn authorize(stream: &Arc<TcpStream>, author_address: &SocketAddr, token: &Strin
         eprintln!("ERROR: Could not passing message to {author_address}: {err}");
     });
     let mut buffer = [0u8; TOKEN_LEN * 2];
-    let n = stream.as_ref().read(&mut buffer).map_err(|err| {
-        eprintln!("ERROR: Could not read message from {author_address}: {err}");
-    })?;
-
-    if n < buffer.len() {
-        eprintln!("ERROR: Token Len is not legal : {n}");
-        return Err(());
+    let mut filled = 0;
+    while filled < buffer.len() {
+        let n = stream.as_ref().read(&mut buffer[filled..]).map_err(|err| {
+            eprintln!("ERROR: Could not read message from {author_address}: {err}");
+        })?;
+        if n == 0 {
+            eprintln!("ERROR: Client {author_address} disconnected during authorization");
+            return Err(());
+        }
+        filled += n;
     }
 
     let buffer = from_utf8(&buffer).map_err(|err| {

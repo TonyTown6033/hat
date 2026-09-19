@@ -1,7 +1,9 @@
 use crossterm::event::{Event, KeyCode, KeyModifiers, poll, read};
 use crossterm::terminal::{self, Clear, ClearType};
 use crossterm::{QueueableCommand, cursor::MoveTo};
-use std::io::{self, Write, stdout};
+use std::io::{self, ErrorKind, Read, Write, stdout};
+use std::net::TcpStream;
+use std::str::from_utf8;
 use std::thread::sleep;
 use std::time::Duration;
 
@@ -25,6 +27,16 @@ fn chat_window(stdout: &mut impl Write, chat: &[String], boundary: Rect) -> io::
 }
 
 fn main() -> io::Result<()> {
+    // 在进入 raw mode 之前，从 stdin 读取服务器打印出来的 token。
+    let mut token = String::new();
+    io::stdin().read_line(&mut token)?;
+    let token = token.trim().to_string();
+
+    let mut stream = TcpStream::connect("127.0.0.1:6969").expect("Can not connect to host");
+    let _ = stream.set_nonblocking(true).expect("set block failed ");
+    // 服务器 authorize() 会先发 "token: "，然后阻塞等 32 字节 token，
+    // 所以这里连上后立刻把 token 发过去。
+    stream.write_all(token.as_bytes())?;
     let _ = terminal::enable_raw_mode()?;
     let mut stdout = stdout();
     let (mut w, mut h) = terminal::size()?;
@@ -35,6 +47,8 @@ fn main() -> io::Result<()> {
     let mut prompt = String::new();
     let mut stop = false;
 
+    let mut buffer = [0; 64];
+
     while !stop {
         while poll(Duration::ZERO).unwrap() {
             match read()? {
@@ -42,6 +56,9 @@ fn main() -> io::Result<()> {
                     w = width;
                     h = height;
                     bar = barchar.repeat(w as usize);
+                }
+                Event::Paste(data) => {
+                    prompt.push_str(&data);
                 }
                 Event::Key(event) => match event.code {
                     KeyCode::Char(code) => {
@@ -51,7 +68,11 @@ fn main() -> io::Result<()> {
                             prompt.push(code);
                         }
                     }
+                    KeyCode::Esc => {
+                        prompt.clear();
+                    }
                     KeyCode::Enter => {
+                        stream.write(prompt.as_bytes())?;
                         chat.push(prompt.clone());
                         prompt.clear();
                     }
@@ -59,6 +80,23 @@ fn main() -> io::Result<()> {
                 },
 
                 _ => {}
+            }
+        }
+        match stream.read(&mut buffer) {
+            Ok(0) => {
+                stop = true;
+            }
+
+            Ok(n) => {
+                chat.push(from_utf8(&buffer[0..n]).unwrap().to_string());
+            }
+
+            Err(e) => {
+                // 非阻塞读在没有数据时会返回 WouldBlock，
+                // 这只是“暂时没数据”，应该继续循环而不是退出程序。
+                if e.kind() != ErrorKind::WouldBlock {
+                    chat.push(e.to_string());
+                }
             }
         }
 
