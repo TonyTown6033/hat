@@ -2,10 +2,16 @@ use crossterm::event::{Event, KeyCode, KeyModifiers, poll, read};
 use crossterm::style::{Color, ResetColor, SetBackgroundColor, SetForegroundColor};
 use crossterm::terminal::{self, Clear, ClearType};
 use crossterm::{QueueableCommand, cursor::MoveTo};
+use std::fs::{self, File};
 use std::io::{self, ErrorKind, Read, Write, stdout};
 use std::net::{Shutdown, TcpStream};
+use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use std::thread;
 use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+const MAX_FILE_SIZE: u64 = 16 * 1024 * 1024;
 
 struct Rect {
     x: usize,
@@ -31,6 +37,47 @@ struct Message {
     kind: MsgKind,
 }
 
+struct PendingDownload {
+    name: String,
+    save_path: PathBuf,
+}
+
+struct Download {
+    name: String,
+    size: u64,
+    received: u64,
+    save_path: PathBuf,
+    file: File,
+}
+
+impl Download {
+    fn start(name: &str, size: u64, save_path: &Path) -> io::Result<Self> {
+        Ok(Self {
+            name: name.to_owned(),
+            size,
+            received: 0,
+            save_path: save_path.to_owned(),
+            file: File::create(save_path)?,
+        })
+    }
+
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        let remaining = (self.size - self.received) as usize;
+        let take = remaining.min(data.len());
+        self.file.write_all(&data[..take])?;
+        self.received += take as u64;
+        Ok(take)
+    }
+
+    fn is_complete(&self) -> bool {
+        self.received == self.size
+    }
+}
+
+enum UploadEvent {
+    Failed { name: String, reason: String },
+}
+
 // C-style command struct: a name, a description, and a function pointer.
 struct Command {
     name: &'static str,
@@ -46,6 +93,9 @@ struct Ctx {
     user: String,
     server: Option<String>,
     started_at: Instant,
+    upload_tx: mpsc::Sender<UploadEvent>,
+    pending_download: Option<PendingDownload>,
+    download: Option<Download>,
 }
 
 impl Ctx {
@@ -69,6 +119,10 @@ impl Ctx {
     }
 
     fn disconnect(&mut self) {
+        if let Some(download) = self.download.take() {
+            let _ = fs::remove_file(&download.save_path);
+        }
+        self.pending_download = None;
         self.stream = None;
         self.server = None;
     }
@@ -159,6 +213,157 @@ fn cmd_disconnect(ctx: &mut Ctx, _args: &[&str]) {
     }
 }
 
+fn validate_filename(name: &str) -> Option<&'static str> {
+    if name.is_empty() || name.len() > 255 {
+        return Some("invalid file name length");
+    }
+    if name.starts_with('.') {
+        return Some("file name cannot start with '.'");
+    }
+    if !name
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-'))
+    {
+        return Some("file name may only contain letters, numbers, '.', '_' and '-'");
+    }
+    None
+}
+
+fn write_all_nonblocking(mut stream: &TcpStream, mut data: &[u8]) -> io::Result<()> {
+    while !data.is_empty() {
+        match stream.write(data) {
+            Ok(0) => return Err(io::Error::new(ErrorKind::WriteZero, "connection closed")),
+            Ok(n) => data = &data[n..],
+            Err(error) if error.kind() == ErrorKind::WouldBlock => sleep(Duration::from_millis(5)),
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn upload_file(stream: &TcpStream, name: &str, path: &Path, size: u64) -> io::Result<()> {
+    let header = format!("PUT {name} {size}\n");
+    write_all_nonblocking(stream, header.as_bytes())?;
+
+    let mut file = File::open(path)?;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        write_all_nonblocking(stream, &buffer[..read])?;
+    }
+    Ok(())
+}
+
+fn cmd_upload(ctx: &mut Ctx, args: &[&str]) {
+    if args.len() != 1 {
+        ctx.system_msg(MsgKind::Warn, "usage: /upload <file>");
+        return;
+    }
+    let Some(stream) = ctx.stream.as_ref() else {
+        ctx.system_msg(
+            MsgKind::Warn,
+            "not connected, use /connect <ip> <port> [token]",
+        );
+        return;
+    };
+    let path = PathBuf::from(args[0]);
+    if !path.is_file() {
+        ctx.system_msg(MsgKind::Error, format!("file not found: {}", args[0]));
+        return;
+    }
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        ctx.system_msg(MsgKind::Error, "invalid file path");
+        return;
+    };
+    if let Some(reason) = validate_filename(name) {
+        ctx.system_msg(MsgKind::Error, reason);
+        return;
+    }
+    let Ok(meta) = fs::metadata(&path) else {
+        ctx.system_msg(MsgKind::Error, "could not read file metadata");
+        return;
+    };
+    if meta.len() > MAX_FILE_SIZE {
+        ctx.system_msg(MsgKind::Error, "file too large (max 16MB)");
+        return;
+    }
+    if ctx.pending_download.is_some() || ctx.download.is_some() {
+        ctx.system_msg(MsgKind::Warn, "a file transfer is already in progress");
+        return;
+    }
+
+    let Ok(stream) = stream.try_clone() else {
+        ctx.system_msg(MsgKind::Error, "could not clone connection");
+        return;
+    };
+    let tx = ctx.upload_tx.clone();
+    let name_owned = name.to_owned();
+    let size = meta.len();
+    ctx.system_msg(MsgKind::System, format!("uploading {name} ({size} bytes)"));
+    thread::spawn(move || {
+        if let Err(error) = upload_file(&stream, &name_owned, &path, size) {
+            let _ = tx.send(UploadEvent::Failed {
+                name: name_owned,
+                reason: error.to_string(),
+            });
+        }
+    });
+}
+
+fn cmd_download(ctx: &mut Ctx, args: &[&str]) {
+    if args.is_empty() || args.len() > 2 {
+        ctx.system_msg(MsgKind::Warn, "usage: /download <name> [save-path]");
+        return;
+    }
+    if ctx.download.is_some() || ctx.pending_download.is_some() {
+        ctx.system_msg(MsgKind::Warn, "a file transfer is already in progress");
+        return;
+    }
+    let name = args[0];
+    let save_path = args
+        .get(1)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(name));
+    if save_path.exists() {
+        ctx.system_msg(
+            MsgKind::Error,
+            format!("file already exists: {}", save_path.display()),
+        );
+        return;
+    }
+    let Some(stream) = ctx.stream.as_mut() else {
+        ctx.system_msg(
+            MsgKind::Warn,
+            "not connected, use /connect <ip> <port> [token]",
+        );
+        return;
+    };
+    ctx.pending_download = Some(PendingDownload {
+        name: name.to_owned(),
+        save_path,
+    });
+    if let Err(error) = stream.write_all(format!("GET {name}\n").as_bytes()) {
+        ctx.pending_download = None;
+        ctx.system_msg(MsgKind::Error, error.to_string());
+    }
+}
+
+fn cmd_files(ctx: &mut Ctx, _args: &[&str]) {
+    let Some(stream) = ctx.stream.as_mut() else {
+        ctx.system_msg(
+            MsgKind::Warn,
+            "not connected, use /connect <ip> <port> [token]",
+        );
+        return;
+    };
+    if let Err(error) = stream.write_all(b"LS\n") {
+        ctx.system_msg(MsgKind::Error, error.to_string());
+    }
+}
+
 // Static command table, like an array of structs in C.
 const COMMANDS: &[Command] = &[
     Command {
@@ -185,6 +390,21 @@ const COMMANDS: &[Command] = &[
         name: "nickname",
         description: "change the user name",
         run: cmd_nickname,
+    },
+    Command {
+        name: "upload",
+        description: "upload a file: /upload <file>",
+        run: cmd_upload,
+    },
+    Command {
+        name: "download",
+        description: "download a file: /download <name> [save-path]",
+        run: cmd_download,
+    },
+    Command {
+        name: "files",
+        description: "list files on the server",
+        run: cmd_files,
     },
 ];
 
@@ -263,6 +483,19 @@ fn handle_server_line(ctx: &mut Ctx, line: &str) {
         }
         "SYS" => ctx.system_msg(MsgKind::System, rest),
         "ERR" => ctx.system_msg(MsgKind::Error, rest),
+        "OK" => ctx.system_msg(MsgKind::System, format!("uploaded {rest}")),
+        "FILES" => {
+            let rest = rest.trim();
+            if rest.is_empty() {
+                ctx.system_msg(MsgKind::System, "(no files)");
+            } else {
+                for entry in rest.split(',') {
+                    if let Some((name, size)) = entry.rsplit_once(':') {
+                        ctx.system_msg(MsgKind::System, format!("{name} ({size} bytes)"));
+                    }
+                }
+            }
+        }
         other => ctx.system_msg(MsgKind::Normal, other),
     }
 }
@@ -435,6 +668,7 @@ fn main() -> io::Result<()> {
     let barchar = "─";
     let mut bar = barchar.repeat(w as usize);
 
+    let (upload_tx, upload_rx) = mpsc::channel();
     let mut ctx = Ctx {
         stream: None,
         chat: Vec::new(),
@@ -442,6 +676,9 @@ fn main() -> io::Result<()> {
         stop: false,
         server: None,
         started_at: Instant::now(),
+        upload_tx,
+        pending_download: None,
+        download: None,
     };
     let mut prompt = String::new();
     let mut show_welcome = true;
@@ -508,36 +745,134 @@ fn main() -> io::Result<()> {
             }
         }
 
-        // Read from the server if we are connected.
-        let mut disconnected = false;
-        if let Some(stream) = ctx.stream.as_mut() {
-            match stream.read(&mut buffer) {
-                Ok(0) => {
-                    disconnected = true;
-                }
-                Ok(n) => {
-                    pending.extend_from_slice(&buffer[..n]);
-                }
-                Err(e) if e.kind() == ErrorKind::WouldBlock => {}
-                Err(e) => {
-                    ctx.msg(MsgKind::Error, e.to_string());
-                    disconnected = true;
+        while let Ok(event) = upload_rx.try_recv() {
+            match event {
+                UploadEvent::Failed { name, reason } => {
+                    ctx.system_msg(MsgKind::Error, format!("upload of {name} failed: {reason}"));
                 }
             }
+        }
+
+        // Read from the server if we are connected.
+        let mut disconnected = false;
+        let read_result = ctx.stream.as_mut().map(|stream| stream.read(&mut buffer));
+
+        match read_result {
+            None => {}
+            Some(Ok(0)) => disconnected = true,
+            Some(Ok(n)) => {
+                let data = &buffer[..n];
+                if ctx.download.is_some() {
+                    let result = {
+                        let download = ctx.download.as_mut().unwrap();
+                        download.write(data)
+                    };
+                    match result {
+                        Ok(consumed) => {
+                            if consumed < data.len() {
+                                pending.extend_from_slice(&data[consumed..]);
+                            }
+                        }
+                        Err(error) => {
+                            let download = ctx.download.take().unwrap();
+                            let _ = fs::remove_file(&download.save_path);
+                            ctx.pending_download = None;
+                            ctx.system_msg(MsgKind::Error, format!("download failed: {error}"));
+                        }
+                    }
+                } else {
+                    pending.extend_from_slice(data);
+                }
+            }
+            Some(Err(error)) if error.kind() == ErrorKind::WouldBlock => {}
+            Some(Err(error)) => {
+                ctx.system_msg(MsgKind::Error, error.to_string());
+                disconnected = true;
+            }
+        }
+
+        if ctx.download.as_ref().is_some_and(Download::is_complete) {
+            let done = ctx.download.take().unwrap();
+            ctx.pending_download = None;
+            ctx.system_msg(
+                MsgKind::System,
+                format!("saved {} ({} bytes)", done.name, done.size),
+            );
         }
 
         // Split the accumulated bytes into complete lines and parse them.
         while let Some(pos) = pending.iter().position(|&b| b == b'\n') {
             let raw: Vec<u8> = pending.drain(..=pos).collect();
             let line = String::from_utf8_lossy(&raw).trim_end().to_string();
-            if !line.is_empty() {
-                handle_server_line(&mut ctx, &line);
+            if line.is_empty() {
+                continue;
             }
+
+            if let Some(rest) = line.strip_prefix("FILE ") {
+                let Some((name, size_text)) = rest.rsplit_once(' ') else {
+                    ctx.system_msg(MsgKind::Error, "bad FILE header from server");
+                    disconnected = true;
+                    break;
+                };
+                let Ok(size) = size_text.parse::<u64>() else {
+                    ctx.system_msg(MsgKind::Error, "bad file size from server");
+                    disconnected = true;
+                    break;
+                };
+                if size > MAX_FILE_SIZE {
+                    ctx.system_msg(MsgKind::Error, "server sent an oversized file");
+                    disconnected = true;
+                    break;
+                }
+
+                let save_path = ctx
+                    .pending_download
+                    .as_ref()
+                    .filter(|pending| pending.name == name)
+                    .map(|pending| pending.save_path.clone())
+                    .unwrap_or_else(|| PathBuf::from(name));
+
+                match Download::start(name, size, &save_path) {
+                    Ok(download) => {
+                        ctx.download = Some(download);
+                        ctx.pending_download = None;
+                    }
+                    Err(error) => {
+                        ctx.system_msg(MsgKind::Error, format!("could not save file: {error}"));
+                        disconnected = true;
+                        break;
+                    }
+                }
+
+                if !pending.is_empty() {
+                    let result = {
+                        let download = ctx.download.as_mut().unwrap();
+                        download.write(&pending)
+                    };
+                    match result {
+                        Ok(consumed) => {
+                            pending.drain(..consumed);
+                        }
+                        Err(error) => {
+                            let download = ctx.download.take().unwrap();
+                            let _ = fs::remove_file(&download.save_path);
+                            ctx.pending_download = None;
+                            ctx.system_msg(MsgKind::Error, format!("download failed: {error}"));
+                        }
+                    };
+                }
+                break;
+            }
+
+            handle_server_line(&mut ctx, &line);
         }
 
         if disconnected {
             pending.clear();
-            ctx.msg(MsgKind::Warn, "disconnected");
+            if ctx.download.is_some() {
+                ctx.system_msg(MsgKind::Warn, "download aborted");
+            }
+            ctx.system_msg(MsgKind::Warn, "disconnected");
             ctx.disconnect();
         }
 
