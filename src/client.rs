@@ -2,7 +2,7 @@ use crossterm::event::{Event, KeyCode, KeyModifiers, poll, read};
 use crossterm::terminal::{self, Clear, ClearType};
 use crossterm::{QueueableCommand, cursor::MoveTo};
 use std::io::{self, ErrorKind, Read, Write, stdout};
-use std::net::TcpStream;
+use std::net::{Shutdown, TcpStream};
 use std::str::from_utf8;
 use std::thread::sleep;
 use std::time::Duration;
@@ -25,11 +25,17 @@ struct Command {
 struct Ctx {
     stream: Option<TcpStream>,
     chat: Vec<String>,
+    stop: bool,
 }
 
 fn cmd_connect(ctx: &mut Ctx, args: &[&str]) {
     if args.len() < 2 {
         ctx.chat.push("usage: /connect <ip> <port>".to_string());
+        return;
+    }
+
+    if ctx.stream.is_some() {
+        ctx.chat.push("You already connected".to_string());
         return;
     }
 
@@ -57,6 +63,21 @@ fn cmd_help(ctx: &mut Ctx, _args: &[&str]) {
     }
 }
 
+fn cmd_quit(ctx: &mut Ctx, _args: &[&str]) {
+    ctx.stop = true;
+}
+
+fn cmd_disconnect(ctx: &mut Ctx, _args: &[&str]) {
+    if let Some(stream) = ctx.stream.as_mut() {
+        let _ = stream.shutdown(Shutdown::Write).map_err(|err| {
+            ctx.chat
+                .push(format!("Failed to shutdown the connection : {err}"));
+        });
+    } else {
+        ctx.chat.push("You are not login".to_string());
+    }
+}
+
 // Static command table, like an array of structs in C.
 const COMMANDS: &[Command] = &[
     Command {
@@ -65,11 +86,44 @@ const COMMANDS: &[Command] = &[
         run: cmd_connect,
     },
     Command {
+        name: "disconnect",
+        description: "disconnect the server",
+        run: cmd_disconnect,
+    },
+    Command {
         name: "help",
         description: "show this help",
         run: cmd_help,
     },
+    Command {
+        name: "quit",
+        description: "quit the client",
+        run: cmd_quit,
+    },
 ];
+
+fn complete_command(prompt: &str) -> String {
+    let Some(rest) = prompt.strip_prefix('/') else {
+        return prompt.to_string();
+    };
+
+    // Only complete the command name, not its arguments.
+    if rest.contains(char::is_whitespace) {
+        return prompt.to_string();
+    }
+
+    let matches: Vec<&str> = COMMANDS
+        .iter()
+        .map(|command| command.name)
+        .filter(|name| name.starts_with(rest))
+        .collect();
+
+    if matches.len() == 1 {
+        format!("/{}", matches[0])
+    } else {
+        prompt.to_string()
+    }
+}
 
 fn handle_prompt(ctx: &mut Ctx, prompt: &str) {
     let input = prompt.trim();
@@ -124,13 +178,13 @@ fn main() -> io::Result<()> {
     let mut ctx = Ctx {
         stream: None,
         chat: Vec::new(),
+        stop: false,
     };
     let mut prompt = String::new();
-    let mut stop = false;
 
     let mut buffer = [0; 64];
 
-    while !stop {
+    while !ctx.stop {
         while poll(Duration::ZERO).unwrap() {
             match read()? {
                 Event::Resize(width, height) => {
@@ -144,7 +198,7 @@ fn main() -> io::Result<()> {
                 Event::Key(event) => match event.code {
                     KeyCode::Char(code) => {
                         if event.modifiers.contains(KeyModifiers::CONTROL) && code == 'c' {
-                            stop = true;
+                            ctx.stop = true;
                         } else {
                             prompt.push(code);
                         }
@@ -154,9 +208,17 @@ fn main() -> io::Result<()> {
                     }
                     KeyCode::Enter => {
                         let line = prompt.clone();
-                        prompt.clear();
+                        ctx.chat.push(prompt.clone());
                         handle_prompt(&mut ctx, &line);
+                        prompt.clear();
                     }
+                    KeyCode::Tab => {
+                        prompt = complete_command(&prompt);
+                    }
+                    KeyCode::Backspace => {
+                        prompt.pop();
+                    }
+
                     _ => {}
                 },
 
