@@ -364,6 +364,24 @@ fn cmd_files(ctx: &mut Ctx, _args: &[&str]) {
     }
 }
 
+fn cmd_exec(ctx: &mut Ctx, args: &[&str]) {
+    if args.is_empty() {
+        ctx.system_msg(MsgKind::Warn, "usage: /exec <command>");
+        return;
+    }
+    let command = args.join(" ");
+    let Some(stream) = ctx.stream.as_mut() else {
+        ctx.system_msg(
+            MsgKind::Warn,
+            "not connected, use /connect <ip> <port> [token]",
+        );
+        return;
+    };
+    if let Err(error) = stream.write_all(format!("EXEC {command}\n").as_bytes()) {
+        ctx.system_msg(MsgKind::Error, error.to_string());
+    }
+}
+
 // Static command table, like an array of structs in C.
 const COMMANDS: &[Command] = &[
     Command {
@@ -405,6 +423,11 @@ const COMMANDS: &[Command] = &[
         name: "files",
         description: "list files on the server",
         run: cmd_files,
+    },
+    Command {
+        name: "exec",
+        description: "run a command on the server: /exec <command>",
+        run: cmd_exec,
     },
 ];
 
@@ -484,6 +507,9 @@ fn handle_server_line(ctx: &mut Ctx, line: &str) {
         "SYS" => ctx.system_msg(MsgKind::System, rest),
         "ERR" => ctx.system_msg(MsgKind::Error, rest),
         "OK" => ctx.system_msg(MsgKind::System, format!("uploaded {rest}")),
+        "EXEC_BEGIN" => {}
+        "OUT" => ctx.msg_from("exec", MsgKind::Normal, rest),
+        "EXEC_END" => ctx.system_msg(MsgKind::System, format!("exit code: {rest}")),
         "FILES" => {
             let rest = rest.trim();
             if rest.is_empty() {

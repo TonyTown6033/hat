@@ -4,7 +4,10 @@ use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -21,6 +24,8 @@ const MAX_FILE_SIZE: u64 = 16 * 1024 * 1024;
 const MAX_FILENAME_BYTES: usize = 255;
 const TRANSFER_TIMEOUT: Duration = Duration::from_secs(30);
 const CHUNK_SIZE: usize = 64 * 1024;
+const MAX_EXEC_OUTPUT: usize = 256 * 1024;
+const EXEC_TIMEOUT: Duration = Duration::from_secs(10);
 
 struct FileMeta {
     size: u64,
@@ -61,6 +66,12 @@ enum ServerEvent {
         name: String,
         size: u64,
         temp_path: PathBuf,
+    },
+    ExecFinished {
+        address: SocketAddr,
+        status: i32,
+        output: Vec<u8>,
+        truncated: bool,
     },
 }
 
@@ -172,7 +183,7 @@ fn remove_client(clients: &mut HashMap<SocketAddr, Client>, address: SocketAddr)
     }
 }
 
-fn run_server(events: Receiver<ServerEvent>) {
+fn run_server(events: Receiver<ServerEvent>, events_tx: Sender<ServerEvent>) {
     let uploads = uploads_dir();
     let _ = fs::create_dir_all(&uploads);
     let mut files = load_files(&uploads);
@@ -251,6 +262,26 @@ fn run_server(events: Receiver<ServerEvent>) {
                     from,
                     &format!("SYS {nickname} uploaded {name} ({size} bytes)"),
                 );
+            }
+            ServerEvent::ExecFinished {
+                address,
+                status,
+                output,
+                truncated,
+            } => {
+                let Some(client) = clients.get(&address) else {
+                    continue;
+                };
+                let text = String::from_utf8_lossy(&output);
+                for line in text.lines() {
+                    if !line.is_empty() {
+                        send_to(client, &format!("OUT {line}"));
+                    }
+                }
+                if truncated {
+                    send_to(client, "OUT [output truncated]");
+                }
+                send_to(client, &format!("EXEC_END {status}"));
             }
             ServerEvent::LineReceived { address, line } => {
                 let now = Instant::now();
@@ -370,6 +401,25 @@ fn run_server(events: Receiver<ServerEvent>) {
                             send_to(client, &line);
                         }
                     }
+                    "EXEC" => {
+                        let command = payload.to_owned();
+                        if command.is_empty() {
+                            if let Some(client) = clients.get(&address) {
+                                send_to(client, "ERR empty command");
+                            }
+                            continue;
+                        }
+                        let tx = events_tx.clone();
+                        thread::spawn(move || {
+                            let (status, output, truncated) = run_command(&command);
+                            let _ = tx.send(ServerEvent::ExecFinished {
+                                address,
+                                status,
+                                output,
+                                truncated,
+                            });
+                        });
+                    }
                     _ => {
                         if let Some(client) = clients.get(&address) {
                             send_to(client, "ERR unknown protocol command");
@@ -432,6 +482,90 @@ fn receive_upload(
             temp_path,
         })
         .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "server stopped"))
+}
+
+#[cfg(target_os = "windows")]
+fn shell_command(command: &str) -> Command {
+    let mut cmd = Command::new("cmd");
+    cmd.arg("/C").arg(command);
+    cmd
+}
+
+#[cfg(not(target_os = "windows"))]
+fn shell_command(command: &str) -> Command {
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c").arg(command);
+    cmd
+}
+
+fn spawn_pipe_reader<R: Read + Send + 'static>(
+    mut pipe: R,
+    buffer: Arc<Mutex<Vec<u8>>>,
+    truncated: Arc<AtomicBool>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let mut chunk = [0u8; 8192];
+        loop {
+            match pipe.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let mut buf = buffer.lock().unwrap();
+                    if buf.len() >= MAX_EXEC_OUTPUT {
+                        truncated.store(true, Ordering::Relaxed);
+                    } else {
+                        let take = (MAX_EXEC_OUTPUT - buf.len()).min(n);
+                        buf.extend_from_slice(&chunk[..take]);
+                        if take < n {
+                            truncated.store(true, Ordering::Relaxed);
+                        }
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    })
+}
+
+fn run_command(command: &str) -> (i32, Vec<u8>, bool) {
+    let mut child = match shell_command(command)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => return (-1, error.to_string().into_bytes(), false),
+    };
+
+    let stdout = child.stdout.take().expect("stdout is piped");
+    let stderr = child.stderr.take().expect("stderr is piped");
+
+    let buffer = Arc::new(Mutex::new(Vec::new()));
+    let truncated = Arc::new(AtomicBool::new(false));
+
+    let stdout_handle = spawn_pipe_reader(stdout, Arc::clone(&buffer), Arc::clone(&truncated));
+    let stderr_handle = spawn_pipe_reader(stderr, Arc::clone(&buffer), Arc::clone(&truncated));
+
+    let start = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status.code().unwrap_or(-1),
+            Ok(None) => {
+                if start.elapsed() > EXEC_TIMEOUT {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break 124;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(_) => break -1,
+        }
+    };
+
+    let _ = stdout_handle.join();
+    let _ = stderr_handle.join();
+
+    let output = buffer.lock().unwrap().clone();
+    (status, output, truncated.load(Ordering::Relaxed))
 }
 
 fn handle_connection(
@@ -541,7 +675,8 @@ fn main() -> io::Result<()> {
     println!("Access token: {token}");
 
     let (event_sender, event_receiver) = mpsc::channel();
-    thread::spawn(|| run_server(event_receiver));
+    let server_events = event_sender.clone();
+    thread::spawn(move || run_server(event_receiver, server_events));
 
     for incoming in listener.incoming() {
         match incoming {
