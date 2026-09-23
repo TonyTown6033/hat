@@ -4,7 +4,6 @@ use crossterm::terminal::{self, Clear, ClearType};
 use crossterm::{QueueableCommand, cursor::MoveTo};
 use std::io::{self, ErrorKind, Read, Write, stdout};
 use std::net::{Shutdown, TcpStream};
-use std::str::from_utf8;
 use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -26,6 +25,8 @@ enum MsgKind {
 }
 
 struct Message {
+    time: String,
+    user: String,
     text: String,
     kind: MsgKind,
 }
@@ -42,6 +43,7 @@ struct Ctx {
     stream: Option<TcpStream>,
     chat: Vec<Message>,
     stop: bool,
+    user: String,
     server: Option<String>,
     started_at: Instant,
 }
@@ -49,7 +51,15 @@ struct Ctx {
 impl Ctx {
     // Push a line with a semantic kind so the renderer can color it.
     fn msg(&mut self, kind: MsgKind, text: impl Into<String>) {
+        let user = self.user.clone();
+        self.msg_from(user, kind, text);
+    }
+
+    // Push a line attributed to an explicit user (e.g. an incoming message).
+    fn msg_from(&mut self, user: impl Into<String>, kind: MsgKind, text: impl Into<String>) {
         self.chat.push(Message {
+            time: beijing_clock(),
+            user: user.into(),
             text: text.into(),
             kind,
         });
@@ -63,7 +73,7 @@ impl Ctx {
 
 fn cmd_connect(ctx: &mut Ctx, args: &[&str]) {
     if args.len() < 2 {
-        ctx.msg(MsgKind::Warn, "usage: /connect <ip> <port>");
+        ctx.msg(MsgKind::Warn, "usage: /connect <ip> <port> [token]");
         return;
     }
 
@@ -74,8 +84,15 @@ fn cmd_connect(ctx: &mut Ctx, args: &[&str]) {
 
     let address = format!("{}:{}", args[0], args[1]);
     match TcpStream::connect(&address) {
-        Ok(stream) => {
+        Ok(mut stream) => {
             if let Err(e) = stream.set_nonblocking(true) {
+                ctx.msg(MsgKind::Error, e.to_string());
+                return;
+            }
+            // The server expects the token as the first line.
+            if let Some(token) = args.get(2)
+                && let Err(e) = stream.write_all(format!("{token}\n").as_bytes())
+            {
                 ctx.msg(MsgKind::Error, e.to_string());
                 return;
             }
@@ -101,6 +118,26 @@ fn cmd_help(ctx: &mut Ctx, _args: &[&str]) {
     }
 }
 
+fn cmd_nickname(ctx: &mut Ctx, args: &[&str]) {
+    if args.len() != 1 {
+        ctx.msg(MsgKind::Warn, "usage: /nickname <name>");
+        return;
+    }
+
+    match ctx.stream.as_mut() {
+        Some(stream) => {
+            let out = format!("NICK {}\n", args[0]);
+            if let Err(e) = stream.write_all(out.as_bytes()) {
+                ctx.msg(MsgKind::Error, e.to_string());
+            }
+        }
+        None => ctx.msg(
+            MsgKind::Warn,
+            "not connected, use /connect <ip> <port> [token]",
+        ),
+    }
+}
+
 fn cmd_quit(ctx: &mut Ctx, _args: &[&str]) {
     ctx.stop = true;
 }
@@ -123,7 +160,7 @@ fn cmd_disconnect(ctx: &mut Ctx, _args: &[&str]) {
 const COMMANDS: &[Command] = &[
     Command {
         name: "connect",
-        description: "connect to a server: /connect <ip> <port>",
+        description: "connect to a server: /connect <ip> <port> [token]",
         run: cmd_connect,
     },
     Command {
@@ -140,6 +177,11 @@ const COMMANDS: &[Command] = &[
         name: "quit",
         description: "quit the client",
         run: cmd_quit,
+    },
+    Command {
+        name: "nickname",
+        description: "change the user name",
+        run: cmd_nickname,
     },
 ];
 
@@ -185,14 +227,40 @@ fn handle_prompt(ctx: &mut Ctx, prompt: &str) {
     } else {
         match ctx.stream.as_mut() {
             Some(stream) => {
-                if let Err(e) = stream.write(input.as_bytes()) {
+                let out = format!("MSG {input}\n");
+                if let Err(e) = stream.write_all(out.as_bytes()) {
                     ctx.msg(MsgKind::Error, e.to_string());
                 }
             }
             None => {
-                ctx.msg(MsgKind::Warn, "not connected, use /connect <ip> <port>");
+                ctx.msg(
+                    MsgKind::Warn,
+                    "not connected, use /connect <ip> <port> [token]",
+                );
             }
         }
+    }
+}
+
+// Turn one server line into a chat entry.
+fn handle_server_line(ctx: &mut Ctx, line: &str) {
+    let (kind, rest) = line.split_once(' ').unwrap_or((line, ""));
+    match kind {
+        "MSG" => {
+            let (nick, text) = rest.split_once(' ').unwrap_or((rest, ""));
+            ctx.msg_from(nick, MsgKind::Normal, text);
+        }
+        "NICK" => {
+            let (old, new) = rest.split_once(' ').unwrap_or((rest, ""));
+            ctx.msg(MsgKind::Warn, format!("{old} is now known as {new}"));
+        }
+        "YOU" => {
+            ctx.user = rest.to_string();
+            ctx.msg(MsgKind::System, format!("you are now {rest}"));
+        }
+        "SYS" => ctx.msg(MsgKind::System, rest),
+        "ERR" => ctx.msg(MsgKind::Error, rest),
+        other => ctx.msg(MsgKind::Normal, other),
     }
 }
 
@@ -231,7 +299,13 @@ fn chat_window(stdout: &mut impl Write, chat: &[Message], boundary: Rect) -> io:
     let n = chat.len();
     let size = n.saturating_sub(boundary.h);
     for (dy, msg) in chat.iter().skip(size).enumerate() {
-        let line: String = msg.text.chars().take(boundary.w).collect();
+        let full = format!(
+            "[{time}] <{user}> : {text}",
+            time = msg.time,
+            user = msg.user,
+            text = msg.text
+        );
+        let line: String = full.chars().take(boundary.w).collect();
         stdout
             .queue(MoveTo(boundary.x as u16, (boundary.y + dy) as u16))?
             .queue(SetForegroundColor(kind_color(msg.kind)))?
@@ -296,6 +370,7 @@ fn main() -> io::Result<()> {
     let mut ctx = Ctx {
         stream: None,
         chat: Vec::new(),
+        user: "you".to_string(),
         stop: false,
         server: None,
         started_at: Instant::now(),
@@ -303,6 +378,7 @@ fn main() -> io::Result<()> {
     let mut prompt = String::new();
 
     let mut buffer = [0; 64];
+    let mut pending: Vec<u8> = Vec::new();
 
     while !ctx.stop {
         while poll(Duration::ZERO).unwrap() {
@@ -354,8 +430,7 @@ fn main() -> io::Result<()> {
                     disconnected = true;
                 }
                 Ok(n) => {
-                    let text = from_utf8(&buffer[0..n]).unwrap().to_string();
-                    ctx.msg(MsgKind::Normal, text);
+                    pending.extend_from_slice(&buffer[..n]);
                 }
                 Err(e) if e.kind() == ErrorKind::WouldBlock => {}
                 Err(e) => {
@@ -364,7 +439,18 @@ fn main() -> io::Result<()> {
                 }
             }
         }
+
+        // Split the accumulated bytes into complete lines and parse them.
+        while let Some(pos) = pending.iter().position(|&b| b == b'\n') {
+            let raw: Vec<u8> = pending.drain(..=pos).collect();
+            let line = String::from_utf8_lossy(&raw).trim_end().to_string();
+            if !line.is_empty() {
+                handle_server_line(&mut ctx, &line);
+            }
+        }
+
         if disconnected {
+            pending.clear();
             ctx.msg(MsgKind::Warn, "disconnected");
             ctx.disconnect();
         }

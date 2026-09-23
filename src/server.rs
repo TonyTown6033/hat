@@ -34,6 +34,7 @@ struct Client {
     conn: Arc<TcpStream>,
     last_message: SystemTime,
     strike_count: u32,
+    nick: String,
 }
 
 enum Messages {
@@ -45,8 +46,34 @@ enum Messages {
     },
     NewMessage {
         author_addr: SocketAddr,
-        bytes: Vec<u8>,
+        line: String,
     },
+}
+
+// Validate a requested nickname. Returns the reason it is rejected.
+fn nickname_error(name: &str) -> Option<&'static str> {
+    if name.is_empty() {
+        return Some("nickname is empty");
+    }
+    if name.chars().count() > 16 {
+        return Some("nickname too long (max 16)");
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Some("nickname has invalid characters");
+    }
+    None
+}
+
+// Send a line to every client except `except`.
+fn broadcast(clients: &HashMap<SocketAddr, Client>, except: SocketAddr, message: &str) {
+    for (addr, client) in clients.iter() {
+        if *addr != except {
+            let _ = client.conn.as_ref().write_all(message.as_bytes());
+        }
+    }
 }
 
 fn server(messages_receiver: Receiver<Messages>) -> Result<()> {
@@ -85,12 +112,15 @@ fn server(messages_receiver: Receiver<Messages>) -> Result<()> {
                     );
                     let _ = author.shutdown(std::net::Shutdown::Both);
                 } else {
+                    let nick = format!("user#{}", author_address.port());
+                    let _ = writeln!(author.as_ref(), "YOU {nick}");
                     clients.insert(
                         author_address,
                         Client {
                             conn: author.clone(),
                             last_message: now,
                             strike_count: 0,
+                            nick,
                         },
                     );
                 }
@@ -99,30 +129,15 @@ fn server(messages_receiver: Receiver<Messages>) -> Result<()> {
             Messages::ClientDisconnected { author_addr } => {
                 clients.remove(&author_addr);
             }
-            Messages::NewMessage { author_addr, bytes } => {
+            Messages::NewMessage { author_addr, line } => {
                 let now = SystemTime::now();
-                if let Some(author) = clients.get_mut(&author_addr) {
+
+                // Rate limit first, then release the mutable borrow.
+                let allowed = if let Some(author) = clients.get_mut(&author_addr) {
                     let freq = now.duration_since(author.last_message).expect("TIME STUFF");
-                    // Ban rules: utf8 String
-                    if let Ok(_text) = from_utf8(&bytes) {
-                        println!("author {} send {:?}", Sensitive(author_addr), bytes);
-                        // Banned Rules: freq
-                        if freq > MES_FREQ {
-                            author.last_message = now;
-                            for (addr, client) in clients.iter() {
-                                if *addr != author_addr {
-                                    let _ = client.conn.as_ref().write(&bytes);
-                                }
-                            }
-                        } else {
-                            author.strike_count += 1;
-                            if author.strike_count >= BAN_FREQ {
-                                println!("author {author_addr} was banned");
-                                banned_mfs.insert(author_addr.ip(), now);
-                                let _ = write!(author.conn.as_ref(), "You are banned MFs");
-                                let _ = author.conn.shutdown(std::net::Shutdown::Both);
-                            }
-                        }
+                    if freq > MES_FREQ {
+                        author.last_message = now;
+                        true
                     } else {
                         author.strike_count += 1;
                         if author.strike_count >= BAN_FREQ {
@@ -130,6 +145,69 @@ fn server(messages_receiver: Receiver<Messages>) -> Result<()> {
                             banned_mfs.insert(author_addr.ip(), now);
                             let _ = write!(author.conn.as_ref(), "You are banned MFs");
                             let _ = author.conn.shutdown(std::net::Shutdown::Both);
+                        }
+                        false
+                    }
+                } else {
+                    false
+                };
+                if !allowed {
+                    continue;
+                }
+
+                println!("author {} send {:?}", Sensitive(author_addr), line);
+                let (kind, rest) = line.split_once(' ').unwrap_or((line.as_str(), ""));
+
+                match kind {
+                    "MSG" => {
+                        let Some(nick) =
+                            clients.get(&author_addr).map(|client| client.nick.clone())
+                        else {
+                            continue;
+                        };
+                        let out = format!("MSG {nick} {rest}\n");
+                        broadcast(&clients, author_addr, &out);
+                    }
+                    "NICK" => {
+                        let name = rest.trim();
+                        let error = match nickname_error(name) {
+                            Some(reason) => Some(reason),
+                            None => {
+                                let taken = clients.iter().any(|(addr, client)| {
+                                    *addr != author_addr && client.nick.eq_ignore_ascii_case(name)
+                                });
+                                if taken {
+                                    Some("nickname already taken")
+                                } else {
+                                    None
+                                }
+                            }
+                        };
+
+                        match error {
+                            Some(reason) => {
+                                if let Some(author) = clients.get(&author_addr) {
+                                    let _ = writeln!(author.conn.as_ref(), "ERR {reason}");
+                                }
+                            }
+                            None => {
+                                let old = match clients.get_mut(&author_addr) {
+                                    Some(author) => {
+                                        std::mem::replace(&mut author.nick, name.to_string())
+                                    }
+                                    None => continue,
+                                };
+                                if let Some(author) = clients.get(&author_addr) {
+                                    let _ = writeln!(author.conn.as_ref(), "YOU {name}");
+                                }
+                                let out = format!("NICK {old} {name}\n");
+                                broadcast(&clients, author_addr, &out);
+                            }
+                        }
+                    }
+                    _ => {
+                        if let Some(author) = clients.get(&author_addr) {
+                            let _ = writeln!(author.conn.as_ref(), "ERR unknown command");
                         }
                     }
                 }
@@ -139,7 +217,7 @@ fn server(messages_receiver: Receiver<Messages>) -> Result<()> {
 }
 
 fn authorize(stream: &Arc<TcpStream>, author_address: &SocketAddr, token: &String) -> Result<()> {
-    let _ = write!(stream.as_ref(), "token: ").map_err(|err| {
+    let _ = writeln!(stream.as_ref(), "SYS authenticating").map_err(|err| {
         eprintln!("ERROR: Could not passing message to {author_address}: {err}");
     });
     let mut buffer = [0u8; TOKEN_LEN * 2];
@@ -183,7 +261,7 @@ fn client(stream: Arc<TcpStream>, message_sender: Sender<Messages>, token: Strin
         });
     })?;
 
-    let _ = writeln!(stream.as_ref(), "Welcome to fight club buudy!!").map_err(|err| {
+    let _ = writeln!(stream.as_ref(), "SYS Welcome to the club, buddy!").map_err(|err| {
         eprintln!("ERROR: failed to send message to {author_address}: {err} ");
     });
 
@@ -195,25 +273,16 @@ fn client(stream: Arc<TcpStream>, message_sender: Sender<Messages>, token: Strin
             eprintln!("Could not to connected to client : {err}");
         })?;
 
-    let mut buffer = Vec::new();
-    buffer.resize(64, 0);
+    let mut pending: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 512];
     loop {
-        let n = stream.as_ref().read(&mut buffer).map_err(|err| {
+        let n = stream.as_ref().read(&mut chunk).map_err(|err| {
             eprintln!("Disconnected to client : {err}");
             let _ = message_sender.send(Messages::ClientDisconnected {
                 author_addr: author_address,
             });
         })?;
-        if n > 0 {
-            message_sender
-                .send(Messages::NewMessage {
-                    author_addr: author_address,
-                    bytes: buffer[0..n].to_vec(),
-                })
-                .map_err(|err| {
-                    eprintln!("Disconnected to client : {err}");
-                })?;
-        } else {
+        if n == 0 {
             let _ = message_sender
                 .send(Messages::ClientDisconnected {
                     author_addr: author_address,
@@ -222,6 +291,23 @@ fn client(stream: Arc<TcpStream>, message_sender: Sender<Messages>, token: Strin
                     eprintln!("Could not send message to client : {err}");
                 });
             break;
+        }
+
+        pending.extend_from_slice(&chunk[..n]);
+        while let Some(pos) = pending.iter().position(|&b| b == b'\n') {
+            let raw: Vec<u8> = pending.drain(..=pos).collect();
+            let line = String::from_utf8_lossy(&raw).trim_end().to_string();
+            if line.is_empty() {
+                continue;
+            }
+            message_sender
+                .send(Messages::NewMessage {
+                    author_addr: author_address,
+                    line,
+                })
+                .map_err(|err| {
+                    eprintln!("Disconnected to client : {err}");
+                })?;
         }
     }
     Ok(())
