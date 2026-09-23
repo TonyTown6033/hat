@@ -14,6 +14,94 @@ struct Rect {
     h: usize,
 }
 
+// C-style command struct: a name, a description, and a function pointer.
+struct Command {
+    name: &'static str,
+    description: &'static str,
+    run: fn(&mut Ctx, &[&str]),
+}
+
+// State shared between the main loop and command handlers.
+struct Ctx {
+    stream: Option<TcpStream>,
+    chat: Vec<String>,
+}
+
+fn cmd_connect(ctx: &mut Ctx, args: &[&str]) {
+    if args.len() < 2 {
+        ctx.chat.push("usage: /connect <ip> <port>".to_string());
+        return;
+    }
+
+    let address = format!("{}:{}", args[0], args[1]);
+    match TcpStream::connect(&address) {
+        Ok(stream) => {
+            if let Err(e) = stream.set_nonblocking(true) {
+                ctx.chat.push(e.to_string());
+                return;
+            }
+            ctx.chat.push(format!("connected to {address}"));
+            ctx.stream = Some(stream);
+        }
+        Err(e) => {
+            ctx.chat
+                .push(format!("could not connect to {address}: {e}"));
+        }
+    }
+}
+
+fn cmd_help(ctx: &mut Ctx, _args: &[&str]) {
+    for cmd in COMMANDS {
+        ctx.chat
+            .push(format!("/{} - {}", cmd.name, cmd.description));
+    }
+}
+
+// Static command table, like an array of structs in C.
+const COMMANDS: &[Command] = &[
+    Command {
+        name: "connect",
+        description: "connect to a server: /connect <ip> <port>",
+        run: cmd_connect,
+    },
+    Command {
+        name: "help",
+        description: "show this help",
+        run: cmd_help,
+    },
+];
+
+fn handle_prompt(ctx: &mut Ctx, prompt: &str) {
+    let input = prompt.trim();
+    if input.is_empty() {
+        return;
+    }
+
+    // Commands start with '/'.
+    if let Some(rest) = input.strip_prefix('/') {
+        let mut parts = rest.split_whitespace();
+        let name = parts.next().unwrap_or("");
+        let args: Vec<&str> = parts.collect();
+
+        match COMMANDS.iter().find(|cmd| cmd.name == name) {
+            Some(cmd) => (cmd.run)(ctx, &args),
+            None => ctx.chat.push(format!("unknown command: /{name}")),
+        }
+    } else {
+        match ctx.stream.as_mut() {
+            Some(stream) => {
+                if let Err(e) = stream.write(input.as_bytes()) {
+                    ctx.chat.push(e.to_string());
+                }
+            }
+            None => {
+                ctx.chat
+                    .push("not connected, use /connect <ip> <port>".to_string());
+            }
+        }
+    }
+}
+
 fn chat_window(stdout: &mut impl Write, chat: &[String], boundary: Rect) -> io::Result<()> {
     let n = chat.len();
     let size = n.checked_sub(boundary.h).unwrap_or(0);
@@ -27,15 +115,16 @@ fn chat_window(stdout: &mut impl Write, chat: &[String], boundary: Rect) -> io::
 }
 
 fn main() -> io::Result<()> {
-    let mut stream = TcpStream::connect("127.0.0.1:6969").expect("Can not connect to host");
-    let _ = stream.set_nonblocking(true).expect("set block failed ");
     let _ = terminal::enable_raw_mode()?;
     let mut stdout = stdout();
     let (mut w, mut h) = terminal::size()?;
     let barchar = "─";
     let mut bar = barchar.repeat(w as usize);
 
-    let mut chat = Vec::new();
+    let mut ctx = Ctx {
+        stream: None,
+        chat: Vec::new(),
+    };
     let mut prompt = String::new();
     let mut stop = false;
 
@@ -64,9 +153,9 @@ fn main() -> io::Result<()> {
                         prompt.clear();
                     }
                     KeyCode::Enter => {
-                        stream.write(prompt.as_bytes())?;
-                        chat.push(prompt.clone());
+                        let line = prompt.clone();
                         prompt.clear();
+                        handle_prompt(&mut ctx, &line);
                     }
                     _ => {}
                 },
@@ -74,29 +163,34 @@ fn main() -> io::Result<()> {
                 _ => {}
             }
         }
-        match stream.read(&mut buffer) {
-            Ok(0) => {
-                stop = true;
-            }
 
-            Ok(n) => {
-                chat.push(from_utf8(&buffer[0..n]).unwrap().to_string());
-            }
-
-            Err(e) => {
-                // 非阻塞读在没有数据时会返回 WouldBlock，
-                // 这只是“暂时没数据”，应该继续循环而不是退出程序。
-                if e.kind() != ErrorKind::WouldBlock {
-                    chat.push(e.to_string());
+        // Read from the server if we are connected.
+        let mut disconnected = false;
+        if let Some(stream) = ctx.stream.as_mut() {
+            match stream.read(&mut buffer) {
+                Ok(0) => {
+                    ctx.chat.push("disconnected".to_string());
+                    disconnected = true;
+                }
+                Ok(n) => {
+                    ctx.chat.push(from_utf8(&buffer[0..n]).unwrap().to_string());
+                }
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {}
+                Err(e) => {
+                    ctx.chat.push(e.to_string());
+                    disconnected = true;
                 }
             }
+        }
+        if disconnected {
+            ctx.stream = None;
         }
 
         stdout.queue(Clear(ClearType::All))?;
 
         let _ = chat_window(
             &mut stdout,
-            &chat,
+            &ctx.chat,
             Rect {
                 x: 0,
                 y: 0,
