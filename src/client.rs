@@ -473,32 +473,36 @@ fn main() -> io::Result<()> {
                         show_welcome = false;
                     }
                 }
-                Event::Key(event) => match event.code {
-                    KeyCode::Char(code) => {
-                        if event.modifiers.contains(KeyModifiers::CONTROL) && code == 'c' {
-                            ctx.stop = true;
-                        } else {
-                            prompt.push(code);
+                Event::Key(event) => {
+                    if event.is_press() {
+                        match event.code {
+                            KeyCode::Char(code) => {
+                                if event.modifiers.contains(KeyModifiers::CONTROL) && code == 'c' {
+                                    ctx.stop = true;
+                                } else {
+                                    prompt.push(code);
+                                }
+                            }
+                            KeyCode::Esc => {
+                                prompt.clear();
+                            }
+                            KeyCode::Enter => {
+                                let line = prompt.clone();
+                                ctx.msg_from(ctx.user.clone(), MsgKind::User, prompt.clone());
+                                handle_prompt(&mut ctx, &line);
+                                prompt.clear();
+                            }
+                            KeyCode::Tab => {
+                                prompt = complete_command(&prompt);
+                            }
+                            KeyCode::Backspace => {
+                                prompt.pop();
+                            }
+
+                            _ => {}
                         }
                     }
-                    KeyCode::Esc => {
-                        prompt.clear();
-                    }
-                    KeyCode::Enter => {
-                        let line = prompt.clone();
-                        ctx.msg_from(ctx.user.clone(), MsgKind::User, prompt.clone());
-                        handle_prompt(&mut ctx, &line);
-                        prompt.clear();
-                    }
-                    KeyCode::Tab => {
-                        prompt = complete_command(&prompt);
-                    }
-                    KeyCode::Backspace => {
-                        prompt.pop();
-                    }
-
-                    _ => {}
-                },
+                }
 
                 _ => {}
             }
