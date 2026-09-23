@@ -51,8 +51,11 @@ struct Ctx {
 impl Ctx {
     // Push a line with a semantic kind so the renderer can color it.
     fn msg(&mut self, kind: MsgKind, text: impl Into<String>) {
-        let user = self.user.clone();
-        self.msg_from(user, kind, text);
+        self.msg_from("system", kind, text);
+    }
+
+    fn system_msg(&mut self, kind: MsgKind, text: impl Into<String>) {
+        self.msg(kind, text);
     }
 
     // Push a line attributed to an explicit user (e.g. an incoming message).
@@ -252,15 +255,15 @@ fn handle_server_line(ctx: &mut Ctx, line: &str) {
         }
         "NICK" => {
             let (old, new) = rest.split_once(' ').unwrap_or((rest, ""));
-            ctx.msg(MsgKind::Warn, format!("{old} is now known as {new}"));
+            ctx.system_msg(MsgKind::Warn, format!("{old} is now known as {new}"));
         }
         "YOU" => {
             ctx.user = rest.to_string();
-            ctx.msg(MsgKind::System, format!("you are now {rest}"));
+            ctx.system_msg(MsgKind::System, format!("you are now {rest}"));
         }
-        "SYS" => ctx.msg(MsgKind::System, rest),
-        "ERR" => ctx.msg(MsgKind::Error, rest),
-        other => ctx.msg(MsgKind::Normal, other),
+        "SYS" => ctx.system_msg(MsgKind::System, rest),
+        "ERR" => ctx.system_msg(MsgKind::Error, rest),
+        other => ctx.system_msg(MsgKind::Normal, other),
     }
 }
 
@@ -284,6 +287,46 @@ const FG_WARN: Color = Color::Rgb {
 };
 const FG_ERROR: Color = Color::Rgb { r: 190, g: 0, b: 0 };
 const FG_PROMPT: Color = Color::Rgb { r: 0, g: 0, b: 0 };
+const WELCOME_ART: &[&str] = &[
+    "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣠⣶⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣀⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀",
+    "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣠⣴⣦⡀⢠⣾⣿⡟⠀⠀⢀⣀⣀⣠⣤⣄⣀⣀⣀⣀⡀⠀⠀⠀⢸⣿⣦⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀",
+    "⠀⠀⠀⠀⠀⠀⠀⠀⢀⣼⣿⣻⣿⣽⣿⣿⣿⣷⢶⡟⠉⠛⣋⣀⠀⠀⠁⠀⠉⠉⠹⢻⣶⣤⣸⣿⣿⣿⡀⣀⣤⣄⣀⠀⠀⠀⠀⠀⠀⠀",
+    "⠀⠀⠀⠀⠀⠀⠀⣠⣾⣿⣿⣿⣿⣿⣿⡟⢁⣥⠴⠃⠀⠀⠀⠀⠀⠀⠀⠈⠈⠀⠀⠁⠈⠉⠹⠿⣿⣿⣿⡟⠉⠹⢿⣧⠀⠀⠀⠀⠀⠀",
+    "⠀⠀⠀⠀⠀⣠⣾⣿⣿⣿⣿⣿⣿⣿⣫⡆⠀⠁⠀⠆⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣤⡀⠉⣿⣿⣦⣤⡀⠘⣿⡀⠀⠀⠀⠀⠀",
+    "⠀⠀⠀⢀⡾⠿⣿⣿⣿⣿⢛⣽⣿⡿⣿⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠘⣷⡀⢔⣿⣿⣿⣿⣦⣿⡇⠀⠀⠀⠀⠀",
+    "⠀⠀⠀⠈⢀⣾⣷⣿⢹⣷⣿⣿⣿⢹⡗⠀⢠⣄⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⡀⠀⠘⠀⠀⠀⠀⢸⣷⡆⠛⣿⣿⣿⣿⣿⣿⠀⠀⠀⠀⠀",
+    "⠀⠀⠀⢀⣾⠏⣽⡏⣿⣿⣿⣿⡧⡟⠀⣴⡟⣾⠀⣠⣄⣄⡀⢀⣠⣴⣄⣄⡀⠀⠀⠀⠀⣀⣀⣾⠟⣷⢁⣿⣿⣿⣿⣿⣿⡇⠀⠀⠀⠀",
+    "⠀⠀⠀⣸⣿⣼⡟⢸⣿⣿⣿⣿⠀⠀⠀⣿⣳⢃⢸⣇⣿⢩⣿⡏⣿⠉⠉⠙⣷⢀⠠⣤⣼⡏⣿⠛⠎⣿⣿⣿⣿⣷⠙⢿⣿⣷⠀⠀⠀⠀",
+    "⠀⠀⢰⡿⢸⣿⠃⢸⣿⣿⣿⡇⠀⠀⢀⣿⠀⢸⡿⣿⣿⡟⠛⣿⡇⠀⠀⠀⣿⠘⣦⣿⠀⢣⣿⠀⠀⠈⣿⣿⣿⣿⡆⢘⠹⣿⣇⠀⠀⠀",
+    "⠀⠀⢸⡇⣸⣿⠀⠘⠛⣿⣿⣿⠀⠀⢸⡟⣗⡾⠤⣿⡏⢻⠀⣽⡇⠀⠀⠀⣿⠀⣹⡟⣧⢸⣿⠀⠀⠀⢹⣿⣿⣿⣷⠸⡄⣿⢻⣇⠀⠀",
+    "⠀⠀⠘⢧⡟⣿⠀⠀⠀⠈⢿⣿⠀⣠⣼⣴⠿⣷⣦⣤⣓⢮⣷⠀⠱⡀⠀⠘⢻⢰⢻⣀⣿⣻⢹⡃⠀⠀⠘⡟⠻⣿⣿⡄⡇⣿⠀⢹⡀⠀",
+    "⠀⠀⠀⣸⣇⣸⡇⠀⠀⠀⡆⣿⣧⢠⢹⠉⢂⠘⣿⠿⣟⠳⠜⠗⠀⠀⡼⢴⣞⣻⣯⣍⣏⡁⣼⠁⠀⠀⠀⡇⡄⠀⠹⣷⡇⣿⠀⠀⡇⠀",
+    "⠀⠀⠀⣿⠁⢹⡇⠀⠀⠀⡇⣿⣎⢯⣻⣧⠀⠓⠚⠛⠁⠀⠀⠀⠀⠀⠀⠋⢹⠿⣿⡭⢉⠿⠷⢦⡆⠀⣇⡇⣗⠀⠀⢹⡇⣿⠀⠀⠁⠀",
+    "⠀⠀⠀⢻⡀⢸⠁⠀⠀⠀⢳⢻⣿⣷⣧⣯⡳⢤⣀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⠙⠲⠖⢀⣼⡴⢿⠁⣰⣿⣄⣿⠀⠀⠘⠇⢻⠀⠀⠀⠀",
+    "⠀⠀⠀⠈⢧⢸⠀⠀⠀⠀⠈⠈⠙⣿⣿⣿⡄⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⣩⢋⣴⠏⣰⣿⣿⡄⣯⠀⠀⠀⠀⠈⠀⠀⠀⠀",
+    "⠀⠀⠀⠀⠈⢻⡆⠀⠀⠀⠀⠀⠀⢻⣿⣿⣿⣄⠀⠀⠀⣀⠴⠖⢤⡀⠀⠀⠀⠀⠀⣴⣿⣿⣟⣴⣿⣿⣿⣇⣿⠀⠀⠀⠀⠀⠀⠀⠀⠀",
+    "⠀⠀⠀⠀⠀⠀⣇⠀⠀⠀⠀⠀⠀⡈⣿⣿⣿⣿⣷⣄⠀⠸⣄⣀⣠⠇⠀⠀⣀⣤⣾⣿⣿⣿⣿⣿⣿⣿⡟⣿⢹⠀⠀⠀⠀⠀⠀⠀⠀⠀",
+    "⠀⠀⠀⠀⠀⠀⣿⠀⠀⠀⠀⠀⠀⢱⢹⣿⣿⣿⣿⣧⣹⣦⣄⣀⣠⣴⣶⠿⢿⣿⣿⡟⡿⠟⠋⠉⠉⠙⠧⣿⣿⡇⠀⠀⠀⠀⠀⠀⠀⠀",
+    "⠀⠀⠀⠀⠀⠀⡿⠀⠀⠀⠀⠀⠀⢸⡼⣿⣿⣿⣿⣿⡀⠀⠉⠛⠛⠋⠀⠐⢾⣿⠿⠋⠀⠀⠀⠀⠀⠀⠀⠀⠙⣧⠀⠀⠀⣾⠀⠀⠀⠀",
+    "⠀⠀⠀⠀⠀⢸⠃⠀⠀⠀⠀⠀⠀⢸⡇⣿⣿⡿⣿⡿⠇⠀⠀⠀⣀⡤⠖⠚⠉⠀⠀⠀⠐⢦⣀⠀⠀⠀⠀⠀⠀⠘⡄⠀⠀⠀⢇⠀⠀⠀",
+    "⠀⠀⠀⠀⢠⡏⠀⠀⠀⠀⠀⠀⢀⣸⣷⡿⠿⠓⠋⠐⠒⠒⢶⢞⡁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⠑⢤⡀⠀⠀⠀⠀⢳⠀⠀⠀⠘⣆⠀⠀",
+    "⠀⠀⠀⠀⢠⠏⣀⠀⠀⠀⠀⣠⠞⠉⠀⡠⠀⠀⠀⠀⢀⡰⠀⣚⡽⠚⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠙⢆⠀⠀⠀⢸⡀⠀⠀⠀⠘⢆⠀",
+    "⠀⠀⠀⢰⣯⠞⠁⡏⠀⢀⡞⣡⡤⠖⠋⠒⠉⠭⠉⠉⠁⣦⡞⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⢧⠀⠀⠈⡇⠀⠀⠀⠀⠈⢦",
+    "⠀⠀⣰⣿⠋⠀⢸⡇⣠⠞⠉⠁⠀⠀⠀⠀⠀⠀⠀⠀⢰⢹⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢸⡀⠀⢰⠃⠀⠀⠀⠀⠀⠀",
+    "⣰⡹⠁⠀⠀⢈⡷⠃⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠸⠸⡆⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⣧⠀⣼⠀⠀⠀⠀⠀⠀⠀",
+    "⣿⠇⠀⠀⣠⡿⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣇⢹⡆⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢸⡟⢦⢸⡀⠀⠀⠀⠀⠀⠀",
+    "⡿⠀⡠⢊⠇⡇⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⣉⣡⣤⣤⡤⠤⢤⣤⣀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣾⠘⢇⠀⢷⠀⠀⠀⠀⠀⠀",
+    "⣧⠞⠀⡜⠀⡇⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣀⡤⠖⠛⠉⠁⠀⠀⠀⠀⠀⠀⠀⠈⠉⠓⠦⢤⣀⣀⣀⠀⣰⠃⠀⠸⡄⣸⠀⠀⠀⠀⠀⠀",
+    "⠃⠀⢸⢣⠃⢻⡆⠀⠀⠀⠀⠀⠀⢀⣴⡊⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⠙⣍⣰⡏⠀⠀⠀⣷⠃⠀⠀⠀⠀⠀⠀",
+    "⠀⠀⢸⡄⠀⠀⠻⣄⠀⠀⢀⣠⠾⠛⠉⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠸⣿⠃⠀⠀⢰⡟⠀⠀⠀⠀⠀⠀⠀",
+    "⠀⠀⠨⡇⠀⠀⠐⣼⣷⠶⠿⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢘⡿⠀⠀⠀⠈⡇⠀⠀⠀⠀⠀⠀⠀",
+    "⠀⠀⠀⡃⠀⠀⠀⣿⣿⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣸⠇⠀⠀⠀⠐⡇⠀⠀⠀⠀⠀⠀⠐",
+    "⠀⠀⠀⠁⠀⠀⠀⣽⣿⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢠⡟⠀⠀⠀⠀⢰⡇⠀⠀⠀⠀⠀⠀⠀",
+    "⠀⠀⠀⠀⠀⠀⠀⠸⣿⡆⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢠⣿⠃⠀⠀⠀⠀⢨⡇⠀⠀⠀⠀⠀⠀⠀",
+    "⠀⠀⠀⠀⠀⠀⠀⢰⡟⣷⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢿⣿⠀⠀⠀⠀⠀⡾⠀⠀⠀⠀⠀⠀⠀⠀",
+    "⠀⠀⠀⠀⠀⠀⠀⠘⡗⢸⡆⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢿⡀⠀⠀⠀⣰⠇⠀⠀⠀⠀⠀⠀⠀⠀",
+    "⠀⠀⠀⠀⠀⠀⠀⠀⠀遠 坂 凛 / RIN TOHSAKA⠀⠀⠀⠀⠀⠀⠀⠀⠀",
+];
 
 fn kind_color(kind: MsgKind) -> Color {
     match kind {
@@ -293,6 +336,31 @@ fn kind_color(kind: MsgKind) -> Color {
         MsgKind::Warn => FG_WARN,
         MsgKind::Error => FG_ERROR,
     }
+}
+
+fn draw_welcome(stdout: &mut impl Write, width: usize, height: usize) -> io::Result<()> {
+    let art_height = WELCOME_ART.len().min(height.saturating_sub(2));
+    let y = height.saturating_sub(art_height + 2) / 2;
+
+    for (row, art) in WELCOME_ART.iter().take(art_height).enumerate() {
+        let line: String = art.chars().take(width).collect();
+        let x = width.saturating_sub(line.chars().count()) / 2;
+        stdout
+            .queue(MoveTo(x as u16, (y + row) as u16))?
+            .queue(SetForegroundColor(FG_SYSTEM))?
+            .write_all(line.as_bytes())?;
+    }
+
+    if height > 1 {
+        let hint = "Press any key to enter HAT";
+        let line: String = hint.chars().take(width).collect();
+        let x = width.saturating_sub(line.chars().count()) / 2;
+        stdout
+            .queue(MoveTo(x as u16, height.saturating_sub(1) as u16))?
+            .queue(SetForegroundColor(FG_ERROR))?
+            .write_all(line.as_bytes())?;
+    }
+    Ok(())
 }
 
 fn chat_window(stdout: &mut impl Write, chat: &[Message], boundary: Rect) -> io::Result<()> {
@@ -376,6 +444,7 @@ fn main() -> io::Result<()> {
         started_at: Instant::now(),
     };
     let mut prompt = String::new();
+    let mut show_welcome = true;
 
     let mut buffer = [0; 64];
     let mut pending: Vec<u8> = Vec::new();
@@ -389,7 +458,20 @@ fn main() -> io::Result<()> {
                     bar = barchar.repeat(w as usize);
                 }
                 Event::Paste(data) => {
-                    prompt.push_str(&data);
+                    if show_welcome {
+                        show_welcome = false;
+                    } else {
+                        prompt.push_str(&data);
+                    }
+                }
+                Event::Key(event) if show_welcome => {
+                    if event.modifiers.contains(KeyModifiers::CONTROL)
+                        && event.code == KeyCode::Char('c')
+                    {
+                        ctx.stop = true;
+                    } else {
+                        show_welcome = false;
+                    }
                 }
                 Event::Key(event) => match event.code {
                     KeyCode::Char(code) => {
@@ -404,7 +486,7 @@ fn main() -> io::Result<()> {
                     }
                     KeyCode::Enter => {
                         let line = prompt.clone();
-                        ctx.msg(MsgKind::User, prompt.clone());
+                        ctx.msg_from(ctx.user.clone(), MsgKind::User, prompt.clone());
                         handle_prompt(&mut ctx, &line);
                         prompt.clear();
                     }
@@ -458,7 +540,14 @@ fn main() -> io::Result<()> {
         stdout.queue(SetBackgroundColor(BG))?;
         stdout.queue(Clear(ClearType::All))?;
 
-        let chat_h = h.saturating_sub(3) as usize;
+        if show_welcome {
+            draw_welcome(&mut stdout, w as usize, h as usize)?;
+            stdout.flush()?;
+            sleep(Duration::from_millis(33));
+            continue;
+        }
+
+        let chat_h = (h as usize).saturating_sub(3);
         chat_window(
             &mut stdout,
             &ctx.chat,

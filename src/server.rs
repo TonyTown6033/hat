@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt::Write as _;
 use std::io::{self, BufRead, BufReader, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream};
@@ -12,6 +12,8 @@ const MAX_LINE_BYTES: usize = 4 * 1024;
 const MIN_MESSAGE_INTERVAL: Duration = Duration::from_millis(250);
 const MAX_RATE_LIMIT_VIOLATIONS: u32 = 10;
 const BAN_DURATION: Duration = Duration::from_secs(10 * 60);
+const HISTORY_LIMIT: usize = 1000;
+const HISTORY_ON_CONNECT: usize = 10;
 
 struct Client {
     stream: TcpStream,
@@ -78,6 +80,7 @@ fn remove_client(clients: &mut HashMap<SocketAddr, Client>, address: SocketAddr)
 fn run_server(events: Receiver<ServerEvent>) {
     let mut clients = HashMap::<SocketAddr, Client>::new();
     let mut banned_until = HashMap::<IpAddr, Instant>::new();
+    let mut message_history = VecDeque::<String>::new();
 
     while let Ok(event) = events.recv() {
         match event {
@@ -98,6 +101,9 @@ fn run_server(events: Receiver<ServerEvent>) {
                 // todo: user port will leak user info try use some self add number
                 let nickname = format!("user-{}", address.port());
                 let _ = send_line(&stream, &format!("YOU {nickname}"));
+                for message in message_history.iter().rev().take(HISTORY_ON_CONNECT).rev() {
+                    let _ = send_line(&stream, message);
+                }
                 broadcast(
                     &clients,
                     address,
@@ -164,9 +170,13 @@ fn run_server(events: Receiver<ServerEvent>) {
                             continue;
                         }
                         let nickname = clients[&address].nickname.clone();
-                        // bug:leak info here
+                        let message = format!("MSG {nickname} {text}");
                         println!("{address} ({nickname}): {text}");
-                        broadcast(&clients, address, &format!("MSG {nickname} {text}"));
+                        message_history.push_back(message.clone());
+                        if message_history.len() > HISTORY_LIMIT {
+                            message_history.pop_front();
+                        }
+                        broadcast(&clients, address, &message);
                     }
                     "NICK" => {
                         let requested = payload.trim();
