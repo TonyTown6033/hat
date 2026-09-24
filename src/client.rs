@@ -1,7 +1,7 @@
 use crossterm::event::{Event, KeyCode, KeyModifiers, poll, read};
-use crossterm::style::{Color, ResetColor, SetBackgroundColor, SetForegroundColor};
-use crossterm::terminal::{self, Clear, ClearType};
-use crossterm::{QueueableCommand, cursor::MoveTo};
+use crossterm::style::{Color, Print, ResetColor, SetBackgroundColor, SetForegroundColor};
+use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::{ExecutableCommand, QueueableCommand, cursor::MoveTo};
 use std::fs::{self, File};
 use std::io::{self, ErrorKind, Read, Write, stdout};
 use std::net::{Shutdown, TcpStream};
@@ -18,6 +18,79 @@ struct Rect {
     y: usize,
     w: usize,
     h: usize,
+}
+
+#[derive(Clone, PartialEq)]
+struct Cell {
+    ch: char,
+    fg: Color,
+    bg: Color,
+}
+
+struct Buffer {
+    cells: Vec<Cell>,
+    width: usize,
+    height: usize,
+}
+
+struct Patch {
+    cell: Cell,
+    x: usize,
+    y: usize,
+}
+
+impl Buffer {
+    fn new(width: usize, height: usize) -> Self {
+        Self {
+            cells: vec![Self::blank(); width * height],
+            width,
+            height,
+        }
+    }
+
+    fn blank() -> Cell {
+        Cell {
+            ch: ' ',
+            fg: FG_PROMPT,
+            bg: BG,
+        }
+    }
+
+    fn resize(&mut self, width: usize, height: usize) {
+        self.width = width;
+        self.height = height;
+        self.cells = vec![Self::blank(); width * height];
+    }
+
+    fn clear(&mut self) {
+        self.cells.fill(Self::blank());
+    }
+
+    fn put_cell(&mut self, x: usize, y: usize, ch: char, fg: Color, bg: Color) {
+        if let Some(cell) = self.cells.get_mut(y * self.width + x) {
+            *cell = Cell { ch, fg, bg };
+        }
+    }
+
+    fn put_text(&mut self, x: usize, y: usize, text: &str, fg: Color, bg: Color) {
+        for (dx, ch) in text.chars().enumerate() {
+            self.put_cell(x + dx, y, ch, fg, bg);
+        }
+    }
+
+    fn diff(&self, other: &Self) -> Vec<Patch> {
+        self.cells
+            .iter()
+            .zip(other.cells.iter())
+            .enumerate()
+            .filter(|(_, (a, b))| *a != *b)
+            .map(|(i, (_, cell))| Patch {
+                cell: cell.clone(),
+                x: i % self.width,
+                y: i / self.width,
+            })
+            .collect()
+    }
 }
 
 // Semantic category of a chat line, used to pick its color.
@@ -601,32 +674,26 @@ fn kind_color(kind: MsgKind) -> Color {
     }
 }
 
-fn draw_welcome(stdout: &mut impl Write, width: usize, height: usize) -> io::Result<()> {
+fn draw_welcome(buffer: &mut Buffer) {
+    let width = buffer.width;
+    let height = buffer.height;
     let art_height = WELCOME_ART.len().min(height.saturating_sub(2));
     let y = height.saturating_sub(art_height + 2) / 2;
 
     for (row, art) in WELCOME_ART.iter().take(art_height).enumerate() {
         let line: String = art.chars().take(width).collect();
         let x = width.saturating_sub(line.chars().count()) / 2;
-        stdout
-            .queue(MoveTo(x as u16, (y + row) as u16))?
-            .queue(SetForegroundColor(FG_SYSTEM))?
-            .write_all(line.as_bytes())?;
+        buffer.put_text(x, y + row, &line, FG_SYSTEM, BG);
     }
-
     if height > 1 {
         let hint = "Press any key to enter HAT";
         let line: String = hint.chars().take(width).collect();
         let x = width.saturating_sub(line.chars().count()) / 2;
-        stdout
-            .queue(MoveTo(x as u16, height.saturating_sub(1) as u16))?
-            .queue(SetForegroundColor(FG_ERROR))?
-            .write_all(line.as_bytes())?;
+        buffer.put_text(x, height - 1, &line, FG_ERROR, BG);
     }
-    Ok(())
 }
 
-fn chat_window(stdout: &mut impl Write, chat: &[Message], boundary: Rect) -> io::Result<()> {
+fn chat_window(buffer: &mut Buffer, chat: &[Message], boundary: Rect) {
     let n = chat.len();
     let size = n.saturating_sub(boundary.h);
     for (dy, msg) in chat.iter().skip(size).enumerate() {
@@ -637,12 +704,8 @@ fn chat_window(stdout: &mut impl Write, chat: &[Message], boundary: Rect) -> io:
             text = msg.text
         );
         let line: String = full.chars().take(boundary.w).collect();
-        stdout
-            .queue(MoveTo(boundary.x as u16, (boundary.y + dy) as u16))?
-            .queue(SetForegroundColor(kind_color(msg.kind)))?
-            .write_all(line.as_bytes())?;
+        buffer.put_text(boundary.x, boundary.y + dy, &line, kind_color(msg.kind), BG);
     }
-    Ok(())
 }
 
 fn format_duration(duration: Duration) -> String {
@@ -665,6 +728,28 @@ fn beijing_clock() -> String {
 }
 
 // Build the status line: state, server, uptime and a Beijing clock.
+fn apply_patches(stdout: &mut impl Write, patches: &[Patch]) -> io::Result<()> {
+    let mut fg = FG_PROMPT;
+    let mut bg = BG;
+    let mut previous: Option<(usize, usize)> = None;
+    for patch in patches {
+        if previous != Some((patch.x.saturating_sub(1), patch.y)) {
+            stdout.queue(MoveTo(patch.x as u16, patch.y as u16))?;
+        }
+        if fg != patch.cell.fg {
+            fg = patch.cell.fg;
+            stdout.queue(SetForegroundColor(fg))?;
+        }
+        if bg != patch.cell.bg {
+            bg = patch.cell.bg;
+            stdout.queue(SetBackgroundColor(bg))?;
+        }
+        stdout.queue(Print(patch.cell.ch))?;
+        previous = Some((patch.x, patch.y));
+    }
+    Ok(())
+}
+
 fn status_bar(ctx: &Ctx, width: usize) -> (String, Color) {
     let online = ctx.stream.is_some();
     let (state, color) = if online {
@@ -692,9 +777,12 @@ fn status_bar(ctx: &Ctx, width: usize) -> (String, Color) {
 fn main() -> io::Result<()> {
     terminal::enable_raw_mode()?;
     let mut stdout = stdout();
+    stdout.execute(EnterAlternateScreen)?;
     stdout.queue(SetBackgroundColor(BG))?;
     stdout.flush()?;
     let (mut w, mut h) = terminal::size()?;
+    let mut buf_curr = Buffer::new(w as usize, h as usize);
+    let mut buf_prev = Buffer::new(w as usize, h as usize);
     let barchar = "─";
     let mut bar = barchar.repeat(w as usize);
 
@@ -723,6 +811,8 @@ fn main() -> io::Result<()> {
                     w = width;
                     h = height;
                     bar = barchar.repeat(w as usize);
+                    buf_curr.resize(w as usize, h as usize);
+                    buf_prev.resize(w as usize, h as usize);
                 }
                 Event::Paste(data) => {
                     if show_welcome {
@@ -906,54 +996,52 @@ fn main() -> io::Result<()> {
             ctx.disconnect();
         }
 
-        stdout.queue(SetBackgroundColor(BG))?;
-        stdout.queue(Clear(ClearType::All))?;
+        buf_curr.clear();
 
         if show_welcome {
-            draw_welcome(&mut stdout, w as usize, h as usize)?;
-            stdout.flush()?;
-            sleep(Duration::from_millis(33));
-            continue;
+            draw_welcome(&mut buf_curr);
+        } else {
+            let chat_h = (h as usize).saturating_sub(3);
+            chat_window(
+                &mut buf_curr,
+                &ctx.chat,
+                Rect {
+                    x: 0,
+                    y: 0,
+                    w: w as usize,
+                    h: chat_h,
+                },
+            );
+
+            if h >= 3 {
+                buf_curr.put_text(0, (h - 3) as usize, &bar, FG_NORMAL, BG);
+            }
+            if h >= 2 {
+                let (status, color) = status_bar(&ctx, w as usize);
+                buf_curr.put_text(0, (h - 2) as usize, &status, color, BG);
+            }
+            if h >= 1 {
+                buf_curr.put_text(0, (h - 1) as usize, &format!("> {prompt}"), FG_PROMPT, BG);
+            }
         }
 
-        let chat_h = (h as usize).saturating_sub(3);
-        chat_window(
-            &mut stdout,
-            &ctx.chat,
-            Rect {
-                x: 0,
-                y: 0,
-                w: w as usize,
-                h: chat_h,
-            },
-        )?;
+        let patches = buf_prev.diff(&buf_curr);
+        apply_patches(&mut stdout, &patches)?;
 
-        if h >= 3 {
-            stdout.queue(MoveTo(0, h - 3))?;
-            stdout
-                .queue(SetForegroundColor(FG_NORMAL))?
-                .write_all(bar.as_bytes())?;
-        }
-
-        if h >= 2 {
-            stdout.queue(MoveTo(0, h - 2))?;
-            let (status, color) = status_bar(&ctx, w as usize);
-            stdout
-                .queue(SetForegroundColor(color))?
-                .write_all(status.as_bytes())?;
-        }
-
-        if h >= 1 {
-            stdout.queue(MoveTo(0, h - 1))?;
-            stdout.queue(SetForegroundColor(FG_PROMPT))?;
-            stdout.write_all(b"> ")?;
-            stdout.write_all(prompt.as_bytes())?;
+        // Patch rendering leaves the terminal cursor at the last changed cell.
+        // Put it back at the actual input position every frame; otherwise the
+        // changing clock/status bar makes the cursor appear to jump around.
+        if !show_welcome && h > 0 && w > 0 {
+            let cursor_x = (2 + prompt.chars().count()).min(w as usize - 1);
+            stdout.queue(MoveTo(cursor_x as u16, h - 1))?;
         }
 
         stdout.flush()?;
-        sleep(Duration::from_millis(33));
+        std::mem::swap(&mut buf_curr, &mut buf_prev);
+        sleep(Duration::from_millis(16));
     }
     stdout.queue(ResetColor)?;
+    stdout.execute(LeaveAlternateScreen)?;
     stdout.flush()?;
     terminal::disable_raw_mode()?;
     Ok(())
