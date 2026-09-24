@@ -623,6 +623,17 @@ const FG_WARN: Color = Color::Rgb {
 };
 const FG_ERROR: Color = Color::Rgb { r: 190, g: 0, b: 0 };
 const FG_PROMPT: Color = Color::Rgb { r: 0, g: 0, b: 0 };
+const WELCOME_ART_ASCII: &[&str] = &[
+    "  _   _    _  _____ ",
+    " | | | |  / ||_   _|",
+    " | |_| | / /   | |  ",
+    " |  _  |/ /    | |  ",
+    " | | | / /___  | |  ",
+    " |_| |_\\____/  |_|  ",
+    "",
+    "          HAT",
+];
+
 const WELCOME_ART: &[&str] = &[
     "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣠⣶⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣀⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀",
     "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣠⣴⣦⡀⢠⣾⣿⡟⠀⠀⢀⣀⣀⣠⣤⣄⣀⣀⣀⣀⡀⠀⠀⠀⢸⣿⣦⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀",
@@ -677,11 +688,18 @@ fn kind_color(kind: MsgKind) -> Color {
 fn draw_welcome(buffer: &mut Buffer) {
     let width = buffer.width;
     let height = buffer.height;
-    let art_height = WELCOME_ART.len().min(height.saturating_sub(2));
+    // Legacy Windows CMD code pages/fonts cannot render the Unicode art and
+    // show it as boxes. Use an ASCII-only splash there instead.
+    let art = if cfg!(windows) {
+        WELCOME_ART_ASCII
+    } else {
+        WELCOME_ART
+    };
+    let art_height = art.len().min(height.saturating_sub(2));
     let y = height.saturating_sub(art_height + 2) / 2;
 
-    for (row, art) in WELCOME_ART.iter().take(art_height).enumerate() {
-        let line: String = art.chars().take(width).collect();
+    for (row, art_line) in art.iter().take(art_height).enumerate() {
+        let line: String = art_line.chars().take(width).collect();
         let x = width.saturating_sub(line.chars().count()) / 2;
         buffer.put_text(x, y + row, &line, FG_SYSTEM, BG);
     }
