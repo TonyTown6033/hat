@@ -1,3 +1,4 @@
+use serde::Deserialize;
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Write as _;
 use std::fs::{self, File};
@@ -26,6 +27,36 @@ const TRANSFER_TIMEOUT: Duration = Duration::from_secs(30);
 const CHUNK_SIZE: usize = 64 * 1024;
 const MAX_EXEC_OUTPUT: usize = 256 * 1024;
 const EXEC_TIMEOUT: Duration = Duration::from_secs(10);
+const LLM_TIMEOUT: Duration = Duration::from_secs(120);
+const MAX_LLM_OUTPUT: usize = 256 * 1024;
+const CONFIG_PATH: &str = "config.toml";
+
+#[derive(Debug, Deserialize)]
+struct Config {
+    llm: LlmConfig,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct LlmConfig {
+    api_key: String,
+    model: String,
+    api_url: String,
+}
+
+fn load_config() -> io::Result<Config> {
+    let text = fs::read_to_string(CONFIG_PATH).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("could not read {CONFIG_PATH}: {error}"),
+        )
+    })?;
+    toml::from_str(&text).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("could not parse {CONFIG_PATH}: {error}"),
+        )
+    })
+}
 
 struct FileMeta {
     size: u64,
@@ -72,6 +103,10 @@ enum ServerEvent {
         status: i32,
         output: Vec<u8>,
         truncated: bool,
+    },
+    LlmFinished {
+        address: SocketAddr,
+        result: Result<String, String>,
     },
 }
 
@@ -183,7 +218,11 @@ fn remove_client(clients: &mut HashMap<SocketAddr, Client>, address: SocketAddr)
     }
 }
 
-fn run_server(events: Receiver<ServerEvent>, events_tx: Sender<ServerEvent>) {
+fn run_server(
+    events: Receiver<ServerEvent>,
+    events_tx: Sender<ServerEvent>,
+    llm_config: LlmConfig,
+) {
     let uploads = uploads_dir();
     let _ = fs::create_dir_all(&uploads);
     let mut files = load_files(&uploads);
@@ -282,6 +321,22 @@ fn run_server(events: Receiver<ServerEvent>, events_tx: Sender<ServerEvent>) {
                     send_to(client, "OUT [output truncated]");
                 }
                 send_to(client, &format!("EXEC_END {status}"));
+            }
+            ServerEvent::LlmFinished { address, result } => {
+                let Some(client) = clients.get(&address) else {
+                    continue;
+                };
+                match result {
+                    Ok(answer) => {
+                        for line in answer.lines() {
+                            send_to(client, &format!("LLM {line}"));
+                        }
+                        if answer.is_empty() {
+                            send_to(client, "LLM ");
+                        }
+                    }
+                    Err(error) => send_to(client, &format!("ERR llm request failed: {error}")),
+                }
             }
             ServerEvent::LineReceived { address, line } => {
                 let now = Instant::now();
@@ -400,6 +455,21 @@ fn run_server(events: Receiver<ServerEvent>, events_tx: Sender<ServerEvent>) {
                         if let Some(client) = clients.get(&address) {
                             send_to(client, &line);
                         }
+                    }
+                    "LLM" => {
+                        let prompt = payload.trim().to_owned();
+                        if prompt.is_empty() {
+                            if let Some(client) = clients.get(&address) {
+                                send_to(client, "ERR usage: /llm <prompt>");
+                            }
+                            continue;
+                        }
+                        let tx = events_tx.clone();
+                        let llm_config = llm_config.clone();
+                        thread::spawn(move || {
+                            let result = call_llm(&prompt, &llm_config);
+                            let _ = tx.send(ServerEvent::LlmFinished { address, result });
+                        });
                     }
                     "EXEC" => {
                         let command = payload.to_owned();
@@ -524,6 +594,45 @@ fn spawn_pipe_reader<R: Read + Send + 'static>(
             }
         }
     })
+}
+
+fn call_llm(prompt: &str, config: &LlmConfig) -> Result<String, String> {
+    let url = &config.api_url;
+    let model = &config.model;
+    let body = serde_json::json!({
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}]
+    });
+    let response = reqwest::blocking::Client::new()
+        .post(url)
+        .bearer_auth(&config.api_key)
+        .json(&body)
+        .timeout(LLM_TIMEOUT)
+        .send()
+        .map_err(|error| error.to_string())?;
+    let status = response.status();
+    let value: serde_json::Value = response.json().map_err(|error| error.to_string())?;
+    if !status.is_success() {
+        let detail = value["error"]["message"]
+            .as_str()
+            .unwrap_or("unknown API error");
+        return Err(format!("HTTP {status}: {detail}"));
+    }
+    let answer = value["choices"][0]["message"]["content"]
+        .as_str()
+        .ok_or_else(|| "invalid LLM response".to_owned())?;
+    if answer.len() > MAX_LLM_OUTPUT {
+        let end = answer
+            .char_indices()
+            .take_while(|(index, _)| *index <= MAX_LLM_OUTPUT)
+            .last()
+            .map(|(index, character)| index + character.len_utf8())
+            .unwrap_or(0)
+            .min(answer.len());
+        Ok(answer[..end].to_owned())
+    } else {
+        Ok(answer.to_owned())
+    }
 }
 
 fn run_command(command: &str) -> (i32, Vec<u8>, bool) {
@@ -669,6 +778,11 @@ fn generate_token() -> io::Result<String> {
 }
 
 fn main() -> io::Result<()> {
+    let config = load_config()?;
+    println!(
+        "Using configured model {} at {}",
+        config.llm.model, config.llm.api_url
+    );
     let token = generate_token()?;
     let listener = TcpListener::bind(LISTEN_ADDRESS)?;
     println!("Chat server listening on {LISTEN_ADDRESS}");
@@ -676,7 +790,7 @@ fn main() -> io::Result<()> {
 
     let (event_sender, event_receiver) = mpsc::channel();
     let server_events = event_sender.clone();
-    thread::spawn(move || run_server(event_receiver, server_events));
+    thread::spawn(move || run_server(event_receiver, server_events, config.llm));
 
     for incoming in listener.incoming() {
         match incoming {

@@ -1,0 +1,4 @@
+[llm]
+api_key = "your-api-key"
+model = "gpt-5.6-sol"
+api_url = "https://superelite.studio/v1/chat/completions"

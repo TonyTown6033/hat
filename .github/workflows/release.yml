@@ -58,6 +58,7 @@ jobs:
           cp "target/${{ matrix.target }}/release/client" dist/hat-linux-x86_64-musl/
           cp "target/${{ matrix.target }}/release/server" dist/hat-linux-x86_64-musl/
           cp README.md dist/hat-linux-x86_64-musl/ 2>/dev/null || true
+          cp config.example.toml dist/hat-linux-x86_64-musl/
           tar -C dist -czf "dist/${{ matrix.archive }}" hat-linux-x86_64-musl
 
       - name: Package Windows binaries
@@ -67,6 +68,7 @@ jobs:
           cp "target/${{ matrix.target }}/release/client.exe" dist/hat-windows-x86_64/
           cp "target/${{ matrix.target }}/release/server.exe" dist/hat-windows-x86_64/
           cp README.md dist/hat-windows-x86_64/ 2>/dev/null || true
+          cp config.example.toml dist/hat-windows-x86_64/
           cd dist
           zip -r "${{ matrix.archive }}" hat-windows-x86_64
 

@@ -49,6 +49,7 @@ $ cargo run --bin client      # 另开一个终端
 |------|------|
 | `MSG <text>` | 聊天内容 |
 | `NICK <name>` | 请求改昵称 |
+| `LLM <prompt>` | 请求服务器调用配置的 LLM |
 
 ### 服务器 → 客户端
 
@@ -151,6 +152,7 @@ $ cargo run --bin client      # 另开一个终端
 | `/disconnect` | 断开 |
 | `/help` | 帮助 |
 | `/quit` | 退出 |
+| `/llm <prompt>` | 调用服务器配置的 LLM |
 
 ### 画面
 
@@ -222,7 +224,22 @@ TCP 是字节流，不保证「你发一次 = 对方收一次」。所以：
 
 ---
 
-## 9. 已知问题 / TODO
+## 9. LLM 配置
+
+服务器端的 `/llm` 从项目根目录的 `config.toml` 读取配置：
+
+```toml
+[llm]
+api_key = "your-api-key"
+model = "gpt-5.6-sol"
+api_url = "https://superelite.studio/v1/chat/completions"
+```
+
+配置内容可以参考 Pi 的文件：`~/.pi/agent/models.json` 中的 provider `baseUrl`、`~/.pi/agent/settings.json` 中的默认模型，以及 `~/.pi/agent/auth.json` 中的 API Key。Pi 文件只是参考来源，服务器运行时不会读取 Pi 配置。Release 包会自动包含不带真实密钥的 `config.example.toml`，复制为 `config.toml` 后再填写 API Key。
+
+当前测试配置使用 `superelite/gpt-5.6-sol`。请求在服务器后台线程执行，回答通过 `LLM` 消息返回；配置不存在、格式错误或请求失败时客户端会收到错误消息。`config.toml` 已加入 `.gitignore`，不会提交到 Git。
+
+## 10. 已知问题 / TODO
 
 - **CJK 宽度**：聊天区按「字符个数」截断，中文/emoji 占两格会溢出换行
 - **鉴权没完全并入行协议**：服务器 `authorize()` 仍按固定 32 字节读，靠客户端多发一个 `\n` 混过去
@@ -234,7 +251,7 @@ TCP 是字节流，不保证「你发一次 = 对方收一次」。所以：
 
 ---
 
-## 10. 建议的阅读顺序
+## 11. 建议的阅读顺序
 
 想重新读懂代码，按这个顺序读：
 

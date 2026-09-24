@@ -450,6 +450,26 @@ fn cmd_files(ctx: &mut Ctx, _args: &[&str]) {
     }
 }
 
+fn cmd_llm(ctx: &mut Ctx, args: &[&str]) {
+    if args.is_empty() {
+        ctx.system_msg(MsgKind::Warn, "usage: /llm <prompt>");
+        return;
+    }
+    let Some(stream) = ctx.stream.as_mut() else {
+        ctx.system_msg(
+            MsgKind::Warn,
+            "not connected, use /connect <ip> <port> [token]",
+        );
+        return;
+    };
+    let prompt = args.join(" ");
+    if let Err(error) = stream.write_all(format!("LLM {prompt}\n").as_bytes()) {
+        ctx.system_msg(MsgKind::Error, error.to_string());
+    } else {
+        ctx.system_msg(MsgKind::System, "asking LLM ...");
+    }
+}
+
 fn cmd_exec(ctx: &mut Ctx, args: &[&str]) {
     if args.is_empty() {
         ctx.system_msg(MsgKind::Warn, "usage: /exec <command>");
@@ -509,6 +529,11 @@ const COMMANDS: &[Command] = &[
         name: "files",
         description: "list files on the server",
         run: cmd_files,
+    },
+    Command {
+        name: "llm",
+        description: "ask the configured LLM: /llm <prompt>",
+        run: cmd_llm,
     },
     Command {
         name: "exec",
@@ -601,6 +626,7 @@ fn handle_server_line(ctx: &mut Ctx, line: &str) {
         "OK" => ctx.system_msg(MsgKind::System, format!("uploaded {rest}")),
         "EXEC_BEGIN" => {}
         "OUT" => ctx.msg_from("exec", MsgKind::Normal, rest),
+        "LLM" => ctx.msg_from("llm", MsgKind::Normal, rest),
         "EXEC_END" => ctx.system_msg(MsgKind::System, format!("exit code: {rest}")),
         "FILES" => {
             let rest = rest.trim();
@@ -708,18 +734,52 @@ fn draw_welcome(buffer: &mut Buffer) {
     }
 }
 
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return Vec::new();
+    }
+    let mut lines = Vec::new();
+    for source in text.split('\n') {
+        let mut line = String::new();
+        for ch in source.chars() {
+            if line.chars().count() == width {
+                lines.push(std::mem::take(&mut line));
+            }
+            line.push(ch);
+        }
+        lines.push(line);
+    }
+    lines
+}
+
 fn chat_window(buffer: &mut Buffer, chat: &[Message], boundary: Rect) {
-    let n = chat.len();
-    let size = n.saturating_sub(boundary.h);
-    for (dy, msg) in chat.iter().skip(size).enumerate() {
-        let full = format!(
-            "[{time}] <{user}> : {text}",
-            time = msg.time,
-            user = msg.user,
-            text = msg.text
-        );
-        let line: String = full.chars().take(boundary.w).collect();
-        buffer.put_text(boundary.x, boundary.y + dy, &line, kind_color(msg.kind), BG);
+    let mut lines = Vec::new();
+    for msg in chat {
+        let prefix = format!("[{time}] <{user}> : ", time = msg.time, user = msg.user);
+        let prefix_len = prefix.chars().count();
+        let first_width = boundary.w.saturating_sub(prefix_len);
+        let wrapped = wrap_text(&msg.text, boundary.w.max(1));
+        for (index, text) in wrapped.into_iter().enumerate() {
+            if index == 0 {
+                let available = first_width;
+                let visible: String = text.chars().take(available).collect();
+                lines.push((format!("{prefix}{visible}"), msg.kind));
+                if text.chars().count() > available {
+                    for continuation in wrap_text(
+                        &text.chars().skip(available).collect::<String>(),
+                        boundary.w,
+                    ) {
+                        lines.push((continuation, msg.kind));
+                    }
+                }
+            } else {
+                lines.push((text, msg.kind));
+            }
+        }
+    }
+    let start = lines.len().saturating_sub(boundary.h);
+    for (dy, (line, kind)) in lines.into_iter().skip(start).enumerate() {
+        buffer.put_text(boundary.x, boundary.y + dy, &line, kind_color(kind), BG);
     }
 }
 
@@ -1062,7 +1122,17 @@ fn main() -> io::Result<()> {
                 buf_curr.put_text(0, (h - 2) as usize, &status, color, BG);
             }
             if h >= 1 {
-                buf_curr.put_text(0, (h - 1) as usize, &format!("> {prompt}"), FG_PROMPT, BG);
+                let input_width = w as usize;
+                let input = format!("> {prompt}");
+                let visible: String = input
+                    .chars()
+                    .rev()
+                    .take(input_width)
+                    .collect::<String>()
+                    .chars()
+                    .rev()
+                    .collect();
+                buf_curr.put_text(0, (h - 1) as usize, &visible, FG_PROMPT, BG);
             }
         }
 
