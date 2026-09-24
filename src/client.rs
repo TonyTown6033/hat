@@ -168,6 +168,10 @@ fn cmd_connect(ctx: &mut Ctx, args: &[&str]) {
 
 fn cmd_help(ctx: &mut Ctx, _args: &[&str]) {
     for cmd in COMMANDS {
+        // /exec is intentionally hidden from the help output.
+        if cmd.name == "exec" {
+            continue;
+        }
         ctx.msg(
             MsgKind::System,
             format!("/{} - {}", cmd.name, cmd.description),
