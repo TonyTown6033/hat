@@ -25,5 +25,4 @@ cargo run --bin client
 The server prints an access token when it starts. Use that token with `/connect` in the client.
 
 ## License
-
-This project is for personal and educational use.
+MIT
