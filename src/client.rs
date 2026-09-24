@@ -418,17 +418,19 @@ fn cmd_download(ctx: &mut Ctx, args: &[&str]) {
         );
         return;
     }
-    let Some(stream) = ctx.stream.as_mut() else {
+    if ctx.stream.is_none() {
         ctx.system_msg(
             MsgKind::Warn,
             "not connected, use /connect <ip> <port> [token]",
         );
         return;
-    };
+    }
     ctx.pending_download = Some(PendingDownload {
         name: name.to_owned(),
         save_path,
     });
+    ctx.system_msg(MsgKind::System, format!("downloading {name} ..."));
+    let stream = ctx.stream.as_mut().unwrap();
     if let Err(error) = stream.write_all(format!("GET {name}\n").as_bytes()) {
         ctx.pending_download = None;
         ctx.system_msg(MsgKind::Error, error.to_string());
@@ -589,7 +591,13 @@ fn handle_server_line(ctx: &mut Ctx, line: &str) {
             ctx.system_msg(MsgKind::System, format!("you are now {rest}"));
         }
         "SYS" => ctx.system_msg(MsgKind::System, rest),
-        "ERR" => ctx.system_msg(MsgKind::Error, rest),
+        "ERR" => {
+            // If the server rejects a pending GET there will be no FILE header,
+            // so clear it here; otherwise the next /download would be blocked
+            // by "a file transfer is already in progress".
+            ctx.pending_download = None;
+            ctx.system_msg(MsgKind::Error, rest);
+        }
         "OK" => ctx.system_msg(MsgKind::System, format!("uploaded {rest}")),
         "EXEC_BEGIN" => {}
         "OUT" => ctx.msg_from("exec", MsgKind::Normal, rest),
@@ -813,7 +821,9 @@ fn main() -> io::Result<()> {
     let mut prompt = String::new();
     let mut show_welcome = true;
 
-    let mut buffer = [0; 64];
+    // Bigger read buffer + draining the socket below keeps file transfers fast
+    // (the old 64-byte buffer meant ~4 KB/s because only one read ran per frame).
+    let mut buffer = vec![0u8; 64 * 1024];
     let mut pending: Vec<u8> = Vec::new();
 
     while !ctx.stop {
@@ -888,51 +898,51 @@ fn main() -> io::Result<()> {
             }
         }
 
-        // Read from the server if we are connected.
+        // Read from the server if we are connected. Drain everything that is
+        // available (up to a budget so the UI stays responsive) instead of a
+        // single small read per frame, which made downloads crawl.
         let mut disconnected = false;
-        let read_result = ctx.stream.as_mut().map(|stream| stream.read(&mut buffer));
-
-        match read_result {
-            None => {}
-            Some(Ok(0)) => disconnected = true,
-            Some(Ok(n)) => {
-                let data = &buffer[..n];
-                if ctx.download.is_some() {
-                    let result = {
-                        let download = ctx.download.as_mut().unwrap();
-                        download.write(data)
-                    };
-                    match result {
-                        Ok(consumed) => {
-                            if consumed < data.len() {
-                                pending.extend_from_slice(&data[consumed..]);
+        let mut read_budget: usize = 4 * 1024 * 1024;
+        while read_budget > 0 {
+            let read_result = ctx.stream.as_mut().map(|stream| stream.read(&mut buffer));
+            match read_result {
+                None => break,
+                Some(Ok(0)) => {
+                    disconnected = true;
+                    break;
+                }
+                Some(Ok(n)) => {
+                    read_budget = read_budget.saturating_sub(n);
+                    let data = &buffer[..n];
+                    if ctx.download.is_some() {
+                        let result = {
+                            let download = ctx.download.as_mut().unwrap();
+                            download.write(data)
+                        };
+                        match result {
+                            Ok(consumed) => {
+                                if consumed < data.len() {
+                                    pending.extend_from_slice(&data[consumed..]);
+                                }
+                            }
+                            Err(error) => {
+                                let download = ctx.download.take().unwrap();
+                                let _ = fs::remove_file(&download.save_path);
+                                ctx.pending_download = None;
+                                ctx.system_msg(MsgKind::Error, format!("download failed: {error}"));
                             }
                         }
-                        Err(error) => {
-                            let download = ctx.download.take().unwrap();
-                            let _ = fs::remove_file(&download.save_path);
-                            ctx.pending_download = None;
-                            ctx.system_msg(MsgKind::Error, format!("download failed: {error}"));
-                        }
+                    } else {
+                        pending.extend_from_slice(data);
                     }
-                } else {
-                    pending.extend_from_slice(data);
+                }
+                Some(Err(error)) if error.kind() == ErrorKind::WouldBlock => break,
+                Some(Err(error)) => {
+                    ctx.system_msg(MsgKind::Error, error.to_string());
+                    disconnected = true;
+                    break;
                 }
             }
-            Some(Err(error)) if error.kind() == ErrorKind::WouldBlock => {}
-            Some(Err(error)) => {
-                ctx.system_msg(MsgKind::Error, error.to_string());
-                disconnected = true;
-            }
-        }
-
-        if ctx.download.as_ref().is_some_and(Download::is_complete) {
-            let done = ctx.download.take().unwrap();
-            ctx.pending_download = None;
-            ctx.system_msg(
-                MsgKind::System,
-                format!("saved {} ({} bytes)", done.name, done.size),
-            );
         }
 
         // Split the accumulated bytes into complete lines and parse them.
@@ -1000,6 +1010,22 @@ fn main() -> io::Result<()> {
             }
 
             handle_server_line(&mut ctx, &line);
+        }
+
+        // Report completion after parsing so a download that finishes inside the
+        // FILE branch is announced in the same frame (not one frame later).
+        if ctx.download.as_ref().is_some_and(Download::is_complete) {
+            let done = ctx.download.take().unwrap();
+            ctx.pending_download = None;
+            ctx.system_msg(
+                MsgKind::System,
+                format!(
+                    "saved {} -> {} ({} bytes)",
+                    done.name,
+                    done.save_path.display(),
+                    done.size
+                ),
+            );
         }
 
         if disconnected {
