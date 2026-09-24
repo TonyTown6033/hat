@@ -1,6 +1,6 @@
 use crossterm::event::{Event, KeyCode, KeyModifiers, poll, read};
 use crossterm::style::{Color, Print, ResetColor, SetBackgroundColor, SetForegroundColor};
-use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{ExecutableCommand, QueueableCommand, cursor::MoveTo};
 use std::fs::{self, File};
 use std::io::{self, ErrorKind, Read, Write, stdout};
@@ -31,6 +31,7 @@ struct Buffer {
     cells: Vec<Cell>,
     width: usize,
     height: usize,
+    force_full_redraw: bool,
 }
 
 struct Patch {
@@ -45,6 +46,7 @@ impl Buffer {
             cells: vec![Self::blank(); width * height],
             width,
             height,
+            force_full_redraw: false,
         }
     }
 
@@ -60,6 +62,11 @@ impl Buffer {
         self.width = width;
         self.height = height;
         self.cells = vec![Self::blank(); width * height];
+        self.force_full_redraw = false;
+    }
+
+    fn invalidate(&mut self) {
+        self.force_full_redraw = true;
     }
 
     fn clear(&mut self) {
@@ -83,7 +90,7 @@ impl Buffer {
             .iter()
             .zip(other.cells.iter())
             .enumerate()
-            .filter(|(_, (a, b))| *a != *b)
+            .filter(|(_, (a, b))| self.force_full_redraw || *a != *b)
             .map(|(i, (_, cell))| Patch {
                 cell: cell.clone(),
                 x: i % self.width,
@@ -778,11 +785,16 @@ fn main() -> io::Result<()> {
     terminal::enable_raw_mode()?;
     let mut stdout = stdout();
     stdout.execute(EnterAlternateScreen)?;
+    // Do not rely on the terminal's previous colors or contents. Clear the
+    // alternate screen before the first frame, then paint every cell once.
     stdout.queue(SetBackgroundColor(BG))?;
+    stdout.queue(SetForegroundColor(FG_PROMPT))?;
+    stdout.queue(Clear(ClearType::All))?;
     stdout.flush()?;
     let (mut w, mut h) = terminal::size()?;
     let mut buf_curr = Buffer::new(w as usize, h as usize);
     let mut buf_prev = Buffer::new(w as usize, h as usize);
+    buf_prev.invalidate();
     let barchar = "─";
     let mut bar = barchar.repeat(w as usize);
 
@@ -811,8 +823,11 @@ fn main() -> io::Result<()> {
                     w = width;
                     h = height;
                     bar = barchar.repeat(w as usize);
+                    stdout.queue(SetBackgroundColor(BG))?;
+                    stdout.queue(Clear(ClearType::All))?;
                     buf_curr.resize(w as usize, h as usize);
                     buf_prev.resize(w as usize, h as usize);
+                    buf_prev.invalidate();
                 }
                 Event::Paste(data) => {
                     if show_welcome {
