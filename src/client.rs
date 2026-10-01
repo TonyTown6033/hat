@@ -2,7 +2,7 @@ use crossterm::event::{Event, KeyCode, KeyModifiers, poll, read};
 use crossterm::terminal::{self, Clear, ClearType};
 use crossterm::{QueueableCommand, cursor::MoveTo};
 use std::io::{self, ErrorKind, Read, Write, stdout};
-use std::net::TcpStream;
+use std::net::{Shutdown, TcpStream};
 use std::str::from_utf8;
 use std::thread::sleep;
 use std::time::Duration;
@@ -12,6 +12,93 @@ struct Rect {
     y: usize,
     w: usize,
     h: usize,
+}
+
+// C-style command representation used by the client dispatcher.
+struct Command {
+    name: &'static str,
+    description: &'static str,
+    run: fn(&mut Ctx, &[&str]),
+}
+
+struct Ctx {
+    stream: Option<TcpStream>,
+    chat: Vec<String>,
+    stop: bool,
+}
+
+impl Ctx {
+    fn message(&mut self, message: impl Into<String>) {
+        self.chat.push(message.into());
+    }
+}
+
+fn cmd_help(ctx: &mut Ctx, _args: &[&str]) {
+    for command in COMMANDS {
+        ctx.message(format!("/{} - {}", command.name, command.description));
+    }
+}
+
+fn cmd_quit(ctx: &mut Ctx, _args: &[&str]) {
+    ctx.stop = true;
+}
+
+fn cmd_disconnect(ctx: &mut Ctx, _args: &[&str]) {
+    match ctx.stream.take() {
+        Some(stream) => {
+            if let Err(error) = stream.shutdown(Shutdown::Both) {
+                ctx.message(format!("failed to disconnect: {error}"));
+            } else {
+                ctx.message("disconnected");
+            }
+        }
+        None => ctx.message("not connected"),
+    }
+}
+
+const COMMANDS: &[Command] = &[
+    Command {
+        name: "help",
+        description: "show this help",
+        run: cmd_help,
+    },
+    Command {
+        name: "quit",
+        description: "exit the client",
+        run: cmd_quit,
+    },
+    Command {
+        name: "disconnect",
+        description: "disconnect from the server",
+        run: cmd_disconnect,
+    },
+];
+
+fn handle_prompt(ctx: &mut Ctx, prompt: &str) {
+    let input = prompt.trim();
+    if input.is_empty() {
+        return;
+    }
+
+    if let Some(rest) = input.strip_prefix('/') {
+        let mut parts = rest.split_whitespace();
+        let name = parts.next().unwrap_or_default();
+        let args: Vec<&str> = parts.collect();
+        match COMMANDS.iter().find(|command| command.name == name) {
+            Some(command) => (command.run)(ctx, &args),
+            None => ctx.message(format!("unknown command: /{name}")),
+        }
+        return;
+    }
+
+    match ctx.stream.as_mut() {
+        Some(stream) => {
+            if let Err(error) = stream.write_all(input.as_bytes()) {
+                ctx.message(error.to_string());
+            }
+        }
+        None => ctx.message("not connected"),
+    }
 }
 
 fn chat_window(stdout: &mut impl Write, chat: &[String], boundary: Rect) -> io::Result<()> {
@@ -27,98 +114,129 @@ fn chat_window(stdout: &mut impl Write, chat: &[String], boundary: Rect) -> io::
 }
 
 fn main() -> io::Result<()> {
-    // 在进入 raw mode 之前，从 stdin 读取服务器打印出来的 token。
+    // Read the token printed by the server before entering raw mode.
     let mut token = String::new();
     io::stdin().read_line(&mut token)?;
     let token = token.trim().to_string();
 
     let mut stream = TcpStream::connect("127.0.0.1:6969").expect("Can not connect to host");
-    let _ = stream.set_nonblocking(true).expect("set block failed ");
-    // 服务器 authorize() 会先发 "token: "，然后阻塞等 32 字节 token，
-    // 所以这里连上后立刻把 token 发过去。
+    stream.set_nonblocking(true).expect("set block failed");
     stream.write_all(token.as_bytes())?;
-    let _ = terminal::enable_raw_mode()?;
+
+    terminal::enable_raw_mode()?;
+    let result = run_client(stream);
+    let _ = terminal::disable_raw_mode();
+    result
+}
+
+fn run_client(stream: TcpStream) -> io::Result<()> {
     let mut stdout = stdout();
     let (mut w, mut h) = terminal::size()?;
     let barchar = "─";
     let mut bar = barchar.repeat(w as usize);
-
-    let mut chat = Vec::new();
+    let mut ctx = Ctx {
+        stream: Some(stream),
+        chat: Vec::new(),
+        stop: false,
+    };
     let mut prompt = String::new();
-    let mut stop = false;
-
     let mut buffer = [0; 64];
 
-    while !stop {
-        while poll(Duration::ZERO).unwrap() {
+    while !ctx.stop {
+        while poll(Duration::ZERO).unwrap_or(false) {
             match read()? {
                 Event::Resize(width, height) => {
                     w = width;
                     h = height;
                     bar = barchar.repeat(w as usize);
                 }
-                Event::Paste(data) => {
-                    prompt.push_str(&data);
-                }
+                Event::Paste(data) => prompt.push_str(&data),
                 Event::Key(event) => match event.code {
                     KeyCode::Char(code) => {
                         if event.modifiers.contains(KeyModifiers::CONTROL) && code == 'c' {
-                            stop = true;
+                            ctx.stop = true;
                         } else {
                             prompt.push(code);
                         }
                     }
-                    KeyCode::Esc => {
-                        prompt.clear();
+                    KeyCode::Esc => prompt.clear(),
+                    KeyCode::Backspace => {
+                        prompt.pop();
                     }
                     KeyCode::Enter => {
-                        stream.write(prompt.as_bytes())?;
-                        chat.push(prompt.clone());
+                        let line = prompt.clone();
+                        ctx.chat.push(line.clone());
+                        handle_prompt(&mut ctx, &line);
                         prompt.clear();
                     }
                     _ => {}
                 },
-
                 _ => {}
             }
         }
-        match stream.read(&mut buffer) {
-            Ok(0) => {
-                stop = true;
-            }
 
-            Ok(n) => {
-                chat.push(from_utf8(&buffer[0..n]).unwrap().to_string());
-            }
-
-            Err(e) => {
-                // 非阻塞读在没有数据时会返回 WouldBlock，
-                // 这只是“暂时没数据”，应该继续循环而不是退出程序。
-                if e.kind() != ErrorKind::WouldBlock {
-                    chat.push(e.to_string());
+        if let Some(stream) = ctx.stream.as_mut() {
+            match stream.read(&mut buffer) {
+                Ok(0) => {
+                    ctx.message("disconnected");
+                    ctx.stream = None;
+                }
+                Ok(n) => match from_utf8(&buffer[..n]) {
+                    Ok(message) => ctx.message(message),
+                    Err(error) => ctx.message(format!("invalid server response: {error}")),
+                },
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {}
+                Err(error) => {
+                    ctx.message(error.to_string());
+                    ctx.stream = None;
                 }
             }
         }
 
         stdout.queue(Clear(ClearType::All))?;
-
-        let _ = chat_window(
+        chat_window(
             &mut stdout,
-            &chat,
+            &ctx.chat,
             Rect {
                 x: 0,
                 y: 0,
                 w: w as usize,
-                h: (h - 2) as usize,
+                h: (h.saturating_sub(2)) as usize,
             },
         )?;
-        stdout.queue(MoveTo(0, h - 2))?;
+        stdout.queue(MoveTo(0, h.saturating_sub(2)))?;
         stdout.write_all(bar.as_bytes())?;
-        stdout.queue(MoveTo(0, h - 1))?;
+        stdout.queue(MoveTo(0, h.saturating_sub(1)))?;
         stdout.write_all(prompt.as_bytes())?;
         stdout.flush()?;
         sleep(Duration::from_millis(33));
     }
-    let _ = terminal::disable_raw_mode()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn command_table_contains_only_minimal_commands() {
+        assert_eq!(
+            COMMANDS
+                .iter()
+                .map(|command| command.name)
+                .collect::<Vec<_>>(),
+            vec!["help", "quit", "disconnect"]
+        );
+    }
+
+    #[test]
+    fn unknown_command_is_reported() {
+        let mut ctx = Ctx {
+            stream: None,
+            chat: Vec::new(),
+            stop: false,
+        };
+        handle_prompt(&mut ctx, "/missing");
+        assert_eq!(ctx.chat, vec!["unknown command: /missing"]);
+    }
 }
