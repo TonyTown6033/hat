@@ -72,6 +72,11 @@ const COMMANDS: &[Command] = &[
         description: "disconnect from the server",
         run: cmd_disconnect,
     },
+    Command {
+        name: "connect",
+        description: "connect to server",
+        run: cmd_connect,
+    },
 ];
 
 fn handle_prompt(ctx: &mut Ctx, prompt: &str) {
@@ -113,29 +118,47 @@ fn chat_window(stdout: &mut impl Write, chat: &[String], boundary: Rect) -> io::
     Ok(())
 }
 
+fn cmd_connect(ctx: &mut Ctx, args: &[&str]) {
+    if let Some(_stream) = ctx.stream.as_mut() {
+        ctx.message("You already connected ");
+        return;
+    }
+    //args is ip port
+    if args.len() < 2 {
+        ctx.message("/connect ip port");
+        return;
+    }
+    let addr = format!("{}:{}", args[0], args[1]);
+    let stream = match TcpStream::connect(&addr) {
+        Ok(stream) => stream,
+        Err(err) => {
+            ctx.message(format!("failed to connect to {} : {}", addr, err));
+            return;
+        }
+    };
+    if let Err(err) = stream.set_nonblocking(true) {
+        ctx.message(format!("failed to set noblock to {} : {}", addr, err));
+        return;
+    }
+    ctx.stream = Some(stream);
+}
+
 fn main() -> io::Result<()> {
     // Read the token printed by the server before entering raw mode.
-    let mut token = String::new();
-    io::stdin().read_line(&mut token)?;
-    let token = token.trim().to_string();
-
-    let mut stream = TcpStream::connect("127.0.0.1:6969").expect("Can not connect to host");
-    stream.set_nonblocking(true).expect("set block failed");
-    stream.write_all(token.as_bytes())?;
 
     terminal::enable_raw_mode()?;
-    let result = run_client(stream);
+    let result = run_client();
     let _ = terminal::disable_raw_mode();
     result
 }
 
-fn run_client(stream: TcpStream) -> io::Result<()> {
+fn run_client() -> io::Result<()> {
     let mut stdout = stdout();
     let (mut w, mut h) = terminal::size()?;
     let barchar = "─";
     let mut bar = barchar.repeat(w as usize);
     let mut ctx = Ctx {
-        stream: Some(stream),
+        stream: None,
         chat: Vec::new(),
         stop: false,
     };
@@ -204,9 +227,9 @@ fn run_client(stream: TcpStream) -> io::Result<()> {
                 h: (h.saturating_sub(2)) as usize,
             },
         )?;
-        stdout.queue(MoveTo(0, h.saturating_sub(2)))?;
+        stdout.queue(MoveTo(0, h - 2))?;
         stdout.write_all(bar.as_bytes())?;
-        stdout.queue(MoveTo(0, h.saturating_sub(1)))?;
+        stdout.queue(MoveTo(0, h - 1))?;
         stdout.write_all(prompt.as_bytes())?;
         stdout.flush()?;
         sleep(Duration::from_millis(33));
@@ -225,7 +248,7 @@ mod tests {
                 .iter()
                 .map(|command| command.name)
                 .collect::<Vec<_>>(),
-            vec!["help", "quit", "disconnect"]
+            vec!["help", "quit", "disconnect", "connect"]
         );
     }
 
