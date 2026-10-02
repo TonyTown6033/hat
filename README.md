@@ -22,7 +22,15 @@ Start the client in another terminal:
 cargo run --bin client
 ```
 
-The server prints an access token when it starts. Use that token with `/connect` in the client.
+The server prints an access token when it starts. In the client, connect with
+the token as the third argument:
+
+```text
+/connect 127.0.0.1 6969 <token>
+```
+
+Use `/nickname <name>` to change your nickname. See [PROTOCOL.md](PROTOCOL.md)
+for the full line protocol.
 
 ## License
 MIT

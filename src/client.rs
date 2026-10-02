@@ -56,6 +56,21 @@ fn cmd_disconnect(ctx: &mut Ctx, _args: &[&str]) {
     }
 }
 
+fn cmd_nickname(ctx: &mut Ctx, args: &[&str]) {
+    if args.len() != 1 {
+        ctx.message("usage: /nickname <name>");
+        return;
+    }
+    match ctx.stream.as_mut() {
+        Some(stream) => {
+            if let Err(error) = stream.write_all(format!("NICK {}\n", args[0]).as_bytes()) {
+                ctx.message(error.to_string());
+            }
+        }
+        None => ctx.message("not connected"),
+    }
+}
+
 const COMMANDS: &[Command] = &[
     Command {
         name: "help",
@@ -76,6 +91,11 @@ const COMMANDS: &[Command] = &[
         name: "connect",
         description: "connect to server",
         run: cmd_connect,
+    },
+    Command {
+        name: "nickname",
+        description: "change your nickname",
+        run: cmd_nickname,
     },
 ];
 
@@ -98,11 +118,31 @@ fn handle_prompt(ctx: &mut Ctx, prompt: &str) {
 
     match ctx.stream.as_mut() {
         Some(stream) => {
-            if let Err(error) = stream.write_all(input.as_bytes()) {
+            // Regular input is a chat message on the line protocol.
+            if let Err(error) = stream.write_all(format!("MSG {input}\n").as_bytes()) {
                 ctx.message(error.to_string());
             }
         }
         None => ctx.message("not connected"),
+    }
+}
+
+// Turn one server line into a chat entry.
+fn handle_server_line(ctx: &mut Ctx, line: &str) {
+    let (kind, rest) = line.split_once(' ').unwrap_or((line, ""));
+    match kind {
+        "MSG" => {
+            let (nick, text) = rest.split_once(' ').unwrap_or((rest, ""));
+            ctx.message(format!("<{nick}> {text}"));
+        }
+        "NICK" => {
+            let (old, new) = rest.split_once(' ').unwrap_or((rest, ""));
+            ctx.message(format!("{old} is now known as {new}"));
+        }
+        "YOU" => ctx.message(format!("you are now {rest}")),
+        "SYS" => ctx.message(rest),
+        "ERR" => ctx.message(format!("error: {rest}")),
+        _ => ctx.message(line.to_owned()),
     }
 }
 
@@ -123,19 +163,26 @@ fn cmd_connect(ctx: &mut Ctx, args: &[&str]) {
         ctx.message("You already connected ");
         return;
     }
-    //args is ip port
+    // args is ip port [token]
     if args.len() < 2 {
-        ctx.message("/connect ip port");
+        ctx.message("/connect <ip> <port> [token]");
         return;
     }
     let addr = format!("{}:{}", args[0], args[1]);
-    let stream = match TcpStream::connect(&addr) {
+    let mut stream = match TcpStream::connect(&addr) {
         Ok(stream) => stream,
         Err(err) => {
             ctx.message(format!("failed to connect to {} : {}", addr, err));
             return;
         }
     };
+    // The server expects the access token as the first line.
+    if let Some(token) = args.get(2)
+        && let Err(error) = stream.write_all(format!("{token}\n").as_bytes())
+    {
+        ctx.message(error.to_string());
+        return;
+    }
     if let Err(err) = stream.set_nonblocking(true) {
         ctx.message(format!("failed to set noblock to {} : {}", addr, err));
         return;
@@ -163,7 +210,8 @@ fn run_client() -> io::Result<()> {
         stop: false,
     };
     let mut prompt = String::new();
-    let mut buffer = [0; 64];
+    let mut pending = String::new();
+    let mut buffer = [0; 4096];
 
     while !ctx.stop {
         while poll(Duration::ZERO).unwrap_or(false) {
@@ -203,15 +251,24 @@ fn run_client() -> io::Result<()> {
                 Ok(0) => {
                     ctx.message("disconnected");
                     ctx.stream = None;
+                    pending.clear();
                 }
                 Ok(n) => match from_utf8(&buffer[..n]) {
-                    Ok(message) => ctx.message(message),
+                    Ok(text) => {
+                        // The protocol is line-based, so buffer partial reads.
+                        pending.push_str(text);
+                        while let Some(newline) = pending.find('\n') {
+                            let line: String = pending.drain(..=newline).collect();
+                            handle_server_line(&mut ctx, line.trim_end_matches(['\r', '\n']));
+                        }
+                    }
                     Err(error) => ctx.message(format!("invalid server response: {error}")),
                 },
                 Err(error) if error.kind() == ErrorKind::WouldBlock => {}
                 Err(error) => {
                     ctx.message(error.to_string());
                     ctx.stream = None;
+                    pending.clear();
                 }
             }
         }
@@ -241,6 +298,14 @@ fn run_client() -> io::Result<()> {
 mod tests {
     use super::*;
 
+    fn ctx() -> Ctx {
+        Ctx {
+            stream: None,
+            chat: Vec::new(),
+            stop: false,
+        }
+    }
+
     #[test]
     fn command_table_contains_only_minimal_commands() {
         assert_eq!(
@@ -248,18 +313,37 @@ mod tests {
                 .iter()
                 .map(|command| command.name)
                 .collect::<Vec<_>>(),
-            vec!["help", "quit", "disconnect", "connect"]
+            vec!["help", "quit", "disconnect", "connect", "nickname"]
         );
     }
 
     #[test]
     fn unknown_command_is_reported() {
-        let mut ctx = Ctx {
-            stream: None,
-            chat: Vec::new(),
-            stop: false,
-        };
+        let mut ctx = ctx();
         handle_prompt(&mut ctx, "/missing");
         assert_eq!(ctx.chat, vec!["unknown command: /missing"]);
+    }
+
+    #[test]
+    fn server_message_is_rendered_with_nickname() {
+        let mut ctx = ctx();
+        handle_server_line(&mut ctx, "MSG alice hello there");
+        assert_eq!(ctx.chat, vec!["<alice> hello there"]);
+    }
+
+    #[test]
+    fn server_protocol_lines_are_rendered() {
+        let mut ctx = ctx();
+        handle_server_line(&mut ctx, "YOU user-1234");
+        handle_server_line(&mut ctx, "NICK user-1234 alice");
+        handle_server_line(&mut ctx, "ERR nickname is already in use");
+        assert_eq!(
+            ctx.chat,
+            vec![
+                "you are now user-1234",
+                "user-1234 is now known as alice",
+                "error: nickname is already in use",
+            ]
+        );
     }
 }
