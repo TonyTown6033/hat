@@ -224,7 +224,7 @@ fn run_client() -> io::Result<()> {
                 x: 0,
                 y: 0,
                 w: w as usize,
-                h: (h.saturating_sub(2)) as usize,
+                h: (h - 2) as usize,
             },
         )?;
         stdout.queue(MoveTo(0, h - 2))?;
